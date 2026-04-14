@@ -1,0 +1,6 @@
+How to start the FastAPI Stack - 
+uvicorn slack_task_app:app --reload --port 8000 --env-file .env 
+
+How to start ngrok server -
+ngrok http 8000 
+
