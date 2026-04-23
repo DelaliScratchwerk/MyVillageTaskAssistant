@@ -786,30 +786,15 @@ def post_dm(channel_id: str, text: str) -> None:
         logger.error("Unexpected error sending DM to Slack: %s", e)
 
 
-def get_announcement_channel() -> Optional[str]:
-    channel = os.getenv("TASK_ANNOUNCEMENT_CHANNEL", "").strip()
-    return channel or None
-
-
-def post_channel_message(channel_id: str, text: str) -> None:
+def post_dm_to_user(user_id: str, text: str) -> None:
     try:
+        open_resp = get_bot_client().conversations_open(users=[user_id])
+        channel_id = open_resp["channel"]["id"]
         get_bot_client().chat_postMessage(channel=channel_id, text=text)
     except SlackApiError as e:
-        logger.error("Unable to send announcement to Slack channel %s: %s", channel_id, e.response.get('error'))
+        logger.error("Unable to send DM to user %s: %s", user_id, e.response.get('error'))
     except Exception as e:
-        logger.error("Unexpected error sending announcement to Slack channel %s: %s", channel_id, e)
-
-
-def build_task_announcement(task_id: str, title: str, assignee_user_id: str, due_date: Optional[str], priority_rating: int) -> str:
-    due_text = due_date or "No due date"
-    priority_text = PRIORITY_RATING_TO_LABEL.get(priority_rating, "medium")
-    return (
-        f"📌 New task created: *{task_id}*\n"
-        f"*Title:* {title}\n"
-        f"*Assignee:* <@{assignee_user_id}>\n"
-        f"*Due:* {due_text}\n"
-        f"*Priority:* {priority_text}"
-    )
+        logger.error("Unexpected error sending DM to user %s: %s", user_id, e)
 
 
 @app.get("/health")
@@ -890,8 +875,6 @@ async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_
     priority_rating = parse_priority(task.priority)
     status_option_id = parse_status(task.status)
 
-    announcement_channel = get_announcement_channel()
-
     try:
         async with TASK_ID_LOCK:
             next_task_id = get_next_task_id()
@@ -917,15 +900,10 @@ async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_
         or "unknown"
     )
 
-    if announcement_channel:
-        announcement_text = build_task_announcement(
-            task_id=next_task_id,
-            title=title,
-            assignee_user_id=assignee_user_id,
-            due_date=due_date,
-            priority_rating=priority_rating,
-        )
-        post_channel_message(announcement_channel, announcement_text)
+    post_dm_to_user(
+        assignee_user_id,
+        f"📌 A new task has been assigned to you: *{title}*\nTask ID: {next_task_id}\nDue: {due_date or 'No due date'}\nPriority: {PRIORITY_RATING_TO_LABEL.get(priority_rating, 'medium')}"
+    )
 
     return {
         "ok": True,
@@ -1009,6 +987,10 @@ async def slack_events(request: Request):
                         status_option_id=status_option_id,
                         task_id=next_task_id,
                     )
+                post_dm_to_user(
+                    assignee_user_id,
+                    f"📌 A new task has been assigned to you: *{task['title']}*\nTask ID: {next_task_id}\nDue: {task['due_date'] or 'No due date'}\nPriority: {task['priority'] or 'medium'}"
+                )
                 created_count += 1
             except SlackApiError as e:
                 logger.exception("Failed to create task from transcript")
@@ -1066,7 +1048,6 @@ async def slack_events(request: Request):
     if not parsed["status_option_id"]:
         parsed["status_option_id"] = get_settings()["OPT_STATUS_NOT_STARTED"]
 
-    announcement_channel = get_announcement_channel()
     try:
         async with TASK_ID_LOCK:
             next_task_id = get_next_task_id()
@@ -1100,14 +1081,9 @@ async def slack_events(request: Request):
     )
     post_dm(dm_channel_id, confirmation_text)
 
-    if announcement_channel:
-        announcement_text = build_task_announcement(
-            task_id=next_task_id,
-            title=parsed["title"],
-            assignee_user_id=assignee_user_id,
-            due_date=parsed["due_date"],
-            priority_rating=parsed["priority_rating"],
-        )
-        post_channel_message(announcement_channel, announcement_text)
+    post_dm_to_user(
+        assignee_user_id,
+        f"📌 A new task has been assigned to you: *{parsed['title']}*\nTask ID: {next_task_id}\nDue: {parsed['due_date'] or 'No due date'}\nPriority: {PRIORITY_RATING_TO_LABEL.get(parsed['priority_rating'], 'medium')}"
+    )
 
     return JSONResponse({"ok": True})
