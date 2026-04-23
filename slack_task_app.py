@@ -9,6 +9,7 @@ from functools import lru_cache
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -287,6 +288,32 @@ def require_api_key(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def is_slack_user_id(value: str) -> bool:
+    return bool(re.fullmatch(r"U[A-Z0-9]{8,}", value.strip()))
+
+
+def resolve_slack_user(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    normalized = value.strip()
+    mention_match = re.fullmatch(r"<@([A-Z0-9]+)>", normalized)
+    if mention_match:
+        return mention_match.group(1)
+    if is_slack_user_id(normalized):
+        return normalized
+    return resolve_user_id(normalized, "", default_to_sender=False)
+
+
+class TaskCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    assignee: Optional[str] = None
+    due_date: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None
+    created_by: Optional[str] = None
+
+
 def get_next_task_id() -> str:
     settings = get_settings()
     prefix = settings.get("TASK_ID_PREFIX", "DEV")
@@ -425,12 +452,12 @@ def normalize_name(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
-def resolve_user_id(name: str, sender_user_id: str) -> Optional[str]:
+def resolve_user_id(name: str, sender_user_id: str, default_to_sender: bool = True) -> Optional[str]:
     """Resolve an assignee name to a Slack user ID.
-    Defaults to sender if blank.
+    Defaults to sender if blank when default_to_sender is True.
     """
     if not name or not name.strip():
-        return sender_user_id
+        return sender_user_id if default_to_sender else None
 
     normalized = normalize_name(name)
 
@@ -463,7 +490,7 @@ def resolve_user_id(name: str, sender_user_id: str) -> Optional[str]:
         except SlackApiError as e:
             logger.warning("users.list lookup failed: %s", e.response.get("error"))
 
-    return None
+    return sender_user_id if default_to_sender else None
 
 
 def next_weekday(base_date: date, weekday: int, force_next_week: bool = False) -> date:
@@ -741,6 +768,62 @@ async def get_task_by_task_id(task_id: str, _api_key: None = Depends(require_api
     result = dict(target)
     result.pop("raw", None)
     return result
+
+
+@app.post("/tasks")
+async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_api_key)):
+    title = task.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Task title is required.")
+
+    assignee_user_id = resolve_slack_user(task.assignee)
+    if not assignee_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Assignee is required and must be a valid Slack user ID, mention, or team member name.",
+        )
+
+    created_by_user_id = resolve_slack_user(task.created_by) or assignee_user_id
+    due_date = parse_due_date(task.due_date) if task.due_date else None
+    priority_rating = parse_priority(task.priority)
+    status_option_id = parse_status(task.status)
+
+    try:
+        async with TASK_ID_LOCK:
+            next_task_id = get_next_task_id()
+            created = create_slack_list_item(
+                title=title,
+                description=task.description or "",
+                sender_user_id=created_by_user_id,
+                assignee_user_id=assignee_user_id,
+                due_date=due_date,
+                priority_rating=priority_rating,
+                status_option_id=status_option_id,
+                task_id=next_task_id,
+            )
+    except SlackApiError as e:
+        error = e.response.get("error", "unknown_error")
+        logger.exception("Slack Lists create failed")
+        raise HTTPException(status_code=502, detail=f"Slack error: {error}")
+
+    item_id = (
+        created.get("item", {}).get("id")
+        or created.get("id")
+        or created.get("row_id")
+        or "unknown"
+    )
+
+    return {
+        "ok": True,
+        "task_id": next_task_id,
+        "row_id": item_id,
+        "title": title,
+        "assignee": assignee_user_id,
+        "created_by": created_by_user_id,
+        "due_date": due_date,
+        "priority_rating": priority_rating,
+        "status_option_id": status_option_id,
+    }
 
 
 @app.post("/slack/events")

@@ -17,6 +17,7 @@ The app now exposes the following endpoints:
 
 - `GET /tasks`
 - `GET /tasks/{task_id}`
+- `POST /tasks`
 
 Example usage:
 
@@ -25,6 +26,21 @@ curl http://127.0.0.1:8000/tasks
 curl "http://127.0.0.1:8000/tasks?status=In%20progress"
 curl "http://127.0.0.1:8000/tasks?assignee=U03JL8L7GJ0"
 curl http://127.0.0.1:8000/tasks/DEV-0022
+```
+
+Create a new task with JSON:
+
+```bash
+curl -X POST http://127.0.0.1:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Build Slack task API",
+    "description": "Add POST /tasks endpoint and API docs.",
+    "assignee": "delali",
+    "due_date": "next friday",
+    "priority": "high",
+    "status": "Not started"
+  }'
 ```
 
 If `TASK_API_KEY` is enabled in `.env`:
