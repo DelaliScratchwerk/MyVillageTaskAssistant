@@ -788,9 +788,7 @@ def post_dm(channel_id: str, text: str) -> None:
 
 def post_dm_to_user(user_id: str, text: str) -> None:
     try:
-        open_resp = get_bot_client().conversations_open(users=[user_id])
-        channel_id = open_resp["channel"]["id"]
-        get_bot_client().chat_postMessage(channel=channel_id, text=text)
+        get_bot_client().chat_postMessage(channel=user_id, text=text)
     except SlackApiError as e:
         logger.error("Unable to send DM to user %s: %s", user_id, e.response.get('error'))
     except Exception as e:
