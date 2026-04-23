@@ -82,6 +82,11 @@ def get_lists_client() -> WebClient:
 @lru_cache()
 def get_team_user_map() -> Dict[str, str]:
     raw = os.getenv("TEAM_USER_MAP_JSON", "{}")
+    raw = raw.strip()
+    if raw.startswith("'") and raw.endswith("'"):
+        raw = raw[1:-1].strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1].strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -461,36 +466,107 @@ def resolve_user_id(name: str, sender_user_id: str, default_to_sender: bool = Tr
 
     normalized = normalize_name(name)
 
-    # 1) Static map wins
+    # 1) Static map exact match wins
     if normalized in TEAM_USER_MAP:
         return TEAM_USER_MAP[normalized]
 
+    # 1b) Static map partial or sub-name match
+    for key, user_id in TEAM_USER_MAP.items():
+        if key in normalized or normalized in key:
+            return user_id
+
     # 2) Optional dynamic lookup via users.list
     if ENABLE_DYNAMIC_USER_LOOKUP:
+        user_id = find_slack_user_id_by_name(normalized)
+        if user_id:
+            return user_id
+
+    return sender_user_id if default_to_sender else None
+
+
+def find_slack_user_id_by_name(name: str) -> Optional[str]:
+    normalized = normalize_name(name)
+    if not normalized:
+        return None
+
+    exact_matches = []
+    loose_matches = []
+
+    try:
+        cursor = None
+        while True:
+            resp = get_bot_client().users_list(limit=200, cursor=cursor)
+            for member in resp.get("members", []):
+                if member.get("deleted") or member.get("is_bot"):
+                    continue
+
+                profile = member.get("profile", {})
+                candidates = {
+                    normalize_name(member.get("name", "")),
+                    normalize_name(member.get("real_name", "")),
+                    normalize_name(profile.get("display_name", "")),
+                    normalize_name(profile.get("real_name", "")),
+                }
+                candidates = {c for c in candidates if c}
+
+                if normalized in candidates:
+                    exact_matches.append(member["id"])
+                    continue
+
+                for candidate in candidates:
+                    if normalized in candidate or candidate in normalized:
+                        loose_matches.append(member["id"])
+                        break
+
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+    except SlackApiError as e:
+        logger.warning("bot users.list lookup failed: %s", e.response.get("error"))
+        # Fall back to the user token client if available.
         try:
             cursor = None
             while True:
-                resp = get_bot_client().users_list(limit=200, cursor=cursor)
+                resp = get_lists_client().users_list(limit=200, cursor=cursor)
                 for member in resp.get("members", []):
                     if member.get("deleted") or member.get("is_bot"):
                         continue
+
                     profile = member.get("profile", {})
                     candidates = {
-                        normalize_name(member.get("real_name", "")),
                         normalize_name(member.get("name", "")),
+                        normalize_name(member.get("real_name", "")),
                         normalize_name(profile.get("display_name", "")),
                         normalize_name(profile.get("real_name", "")),
                     }
+                    candidates = {c for c in candidates if c}
+
                     if normalized in candidates:
-                        return member["id"]
+                        exact_matches.append(member["id"])
+                        continue
+
+                    for candidate in candidates:
+                        if normalized in candidate or candidate in normalized:
+                            loose_matches.append(member["id"])
+                            break
 
                 cursor = resp.get("response_metadata", {}).get("next_cursor")
                 if not cursor:
                     break
-        except SlackApiError as e:
-            logger.warning("users.list lookup failed: %s", e.response.get("error"))
+        except SlackApiError as e2:
+            logger.warning("user token users.list lookup failed: %s", e2.response.get("error"))
+            return None
 
-    return sender_user_id if default_to_sender else None
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        return exact_matches[0]
+    if len(loose_matches) == 1:
+        return loose_matches[0]
+    if len(loose_matches) > 1:
+        return loose_matches[0]
+
+    return None
 
 
 def next_weekday(base_date: date, weekday: int, force_next_week: bool = False) -> date:
@@ -710,6 +786,32 @@ def post_dm(channel_id: str, text: str) -> None:
         logger.error("Unexpected error sending DM to Slack: %s", e)
 
 
+def get_announcement_channel() -> Optional[str]:
+    channel = os.getenv("TASK_ANNOUNCEMENT_CHANNEL", "").strip()
+    return channel or None
+
+
+def post_channel_message(channel_id: str, text: str) -> None:
+    try:
+        get_bot_client().chat_postMessage(channel=channel_id, text=text)
+    except SlackApiError as e:
+        logger.error("Unable to send announcement to Slack channel %s: %s", channel_id, e.response.get('error'))
+    except Exception as e:
+        logger.error("Unexpected error sending announcement to Slack channel %s: %s", channel_id, e)
+
+
+def build_task_announcement(task_id: str, title: str, assignee_user_id: str, due_date: Optional[str], priority_rating: int) -> str:
+    due_text = due_date or "No due date"
+    priority_text = PRIORITY_RATING_TO_LABEL.get(priority_rating, "medium")
+    return (
+        f"📌 New task created: *{task_id}*\n"
+        f"*Title:* {title}\n"
+        f"*Assignee:* <@{assignee_user_id}>\n"
+        f"*Due:* {due_text}\n"
+        f"*Priority:* {priority_text}"
+    )
+
+
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
@@ -788,6 +890,8 @@ async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_
     priority_rating = parse_priority(task.priority)
     status_option_id = parse_status(task.status)
 
+    announcement_channel = get_announcement_channel()
+
     try:
         async with TASK_ID_LOCK:
             next_task_id = get_next_task_id()
@@ -812,6 +916,16 @@ async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_
         or created.get("row_id")
         or "unknown"
     )
+
+    if announcement_channel:
+        announcement_text = build_task_announcement(
+            task_id=next_task_id,
+            title=title,
+            assignee_user_id=assignee_user_id,
+            due_date=due_date,
+            priority_rating=priority_rating,
+        )
+        post_channel_message(announcement_channel, announcement_text)
 
     return {
         "ok": True,
@@ -952,6 +1066,7 @@ async def slack_events(request: Request):
     if not parsed["status_option_id"]:
         parsed["status_option_id"] = get_settings()["OPT_STATUS_NOT_STARTED"]
 
+    announcement_channel = get_announcement_channel()
     try:
         async with TASK_ID_LOCK:
             next_task_id = get_next_task_id()
@@ -984,5 +1099,15 @@ async def slack_events(request: Request):
         f"Row ID: {row_id}"
     )
     post_dm(dm_channel_id, confirmation_text)
+
+    if announcement_channel:
+        announcement_text = build_task_announcement(
+            task_id=next_task_id,
+            title=parsed["title"],
+            assignee_user_id=assignee_user_id,
+            due_date=parsed["due_date"],
+            priority_rating=parsed["priority_rating"],
+        )
+        post_channel_message(announcement_channel, announcement_text)
 
     return JSONResponse({"ok": True})

@@ -49,6 +49,10 @@ If `TASK_API_KEY` is enabled in `.env`:
 curl -H "X-API-Key: your_key" http://127.0.0.1:8000/tasks
 ```
 
+Optional announcement channel:
+
+- `TASK_ANNOUNCEMENT_CHANNEL` — Slack channel ID or name to receive a task-created notification, for example `#tasks` or `C0123456789`.
+
 ## Slack setup
 - Event Subscriptions: ON
 - Request URL: https://your-public-url/slack/events
