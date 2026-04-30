@@ -4,7 +4,10 @@ import json
 import logging
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
+import calendar
+from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
@@ -22,7 +25,20 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("slack-task-app")
 
-app = FastAPI(title="Slack Task App")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    reminder_task = asyncio.create_task(invoice_reminder_loop())
+    try:
+        yield
+    finally:
+        reminder_task.cancel()
+        try:
+            await reminder_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Slack Task App", lifespan=lifespan)
 TASK_ID_LOCK = asyncio.Lock()
 PROCESSED_EVENT_IDS = set()
 PENDING_TRANSCRIPT_ACTIONS = {}
@@ -797,6 +813,71 @@ def post_dm_to_user(user_id: str, text: str) -> None:
         logger.error("Unable to send DM to user %s: %s", user_id, e.response.get('error'))
     except Exception as e:
         logger.error("Unexpected error sending DM to user %s: %s", user_id, e)
+
+INVOICE_REMINDER_TEXT = "Reminder, please get your invoices submitted to Ms. Perez by tomorrow"
+
+
+def get_invoice_reminder_channel_id() -> str:
+    channel_id = os.getenv("INVOICE_REMINDER_CHANNEL_ID", "").strip()
+    if not channel_id:
+        raise RuntimeError("Missing required environment variable: INVOICE_REMINDER_CHANNEL_ID")
+    return channel_id
+
+
+def get_app_timezone() -> ZoneInfo:
+    tz_name = os.getenv("APP_TIMEZONE", "America/New_York").strip()
+    return ZoneInfo(tz_name)
+
+
+def is_last_day_of_month(day: date) -> bool:
+    last_day = calendar.monthrange(day.year, day.month)[1]
+    return day.day == last_day
+
+
+def should_send_invoice_reminder(day: date) -> bool:
+    return day.day == 14 or is_last_day_of_month(day)
+
+
+def next_invoice_reminder_time(now: datetime) -> datetime:
+    tz = get_app_timezone()
+
+    # Start checking from today's 8 AM
+    candidate_day = now.date()
+    while True:
+        candidate = datetime.combine(candidate_day, time(hour=8, minute=0), tzinfo=tz)
+
+        if candidate > now and should_send_invoice_reminder(candidate_day):
+            return candidate
+
+        candidate_day = candidate_day + timedelta(days=1)
+
+
+async def invoice_reminder_loop() -> None:
+    while True:
+        try:
+            tz = get_app_timezone()
+            now = datetime.now(tz)
+            next_run = next_invoice_reminder_time(now)
+
+            sleep_seconds = (next_run - now).total_seconds()
+            logger.info("Next invoice reminder scheduled for %s", next_run.isoformat())
+
+            await asyncio.sleep(sleep_seconds)
+
+            channel_id = get_invoice_reminder_channel_id()
+            post_dm(channel_id, INVOICE_REMINDER_TEXT)
+
+            logger.info("Invoice reminder sent to channel %s", channel_id)
+
+            # Prevent accidental double-send if the loop wakes up again within the same minute
+            await asyncio.sleep(60)
+
+        except asyncio.CancelledError:
+            logger.info("Invoice reminder loop cancelled")
+            raise
+        except Exception:
+            logger.exception("Invoice reminder loop failed")
+            await asyncio.sleep(60)
 
 
 @app.get("/health")
