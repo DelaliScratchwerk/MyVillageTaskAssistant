@@ -873,8 +873,10 @@ async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_
         )
 
     # Swap: created_by is the assignee, assignee is the Task Assistant bot
-    created_by_user_id = resolve_slack_user(task.assignee)
-    assignee_user_id = "U0AMP6LD8DU"
+    #created_by_user_id = resolve_slack_user(task.assignee)
+   # assignee_user_id = "U0AMP6LD8DU"
+    created_by_user_id = "U0AMP6LD8DU" or assignee_user_id
+    assignee_user_id = resolve_slack_user(task.assignee)
     due_date = parse_due_date(task.due_date) if task.due_date else None
     priority_rating = parse_priority(task.priority)
     status_option_id = parse_status(task.status)
