@@ -8,12 +8,16 @@ from datetime import date, datetime, timedelta
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.signature import SignatureVerifier
+
+# Load environment variables from .env file
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("slack-task-app")
@@ -868,7 +872,9 @@ async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_
             detail="Assignee is required and must be a valid Slack user ID, mention, or team member name.",
         )
 
-    created_by_user_id = resolve_slack_user(task.created_by) or assignee_user_id
+    # Swap: created_by is the assignee, assignee is the Task Assistant bot
+    created_by_user_id = resolve_slack_user(task.assignee)
+    assignee_user_id = "U0AMP6LD8DU"
     due_date = parse_due_date(task.due_date) if task.due_date else None
     priority_rating = parse_priority(task.priority)
     status_option_id = parse_status(task.status)
