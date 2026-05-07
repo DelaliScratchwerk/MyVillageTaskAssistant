@@ -450,30 +450,140 @@ def parse_huddle_transcript(transcript: str) -> dict:
     }
 
 
-def handle_transcript_approval(channel_id: str, text: str) -> Optional[str]:
-    """Handle approval commands for pending transcript actions."""
+def parse_transcript_action_indexes(raw_indexes: str, item_count: int) -> list[int]:
+    indexes = []
+    for raw_index in raw_indexes.split(","):
+        try:
+            index = int(raw_index.strip()) - 1
+        except ValueError:
+            continue
+        if 0 <= index < item_count and index not in indexes:
+            indexes.append(index)
+    return indexes
+
+
+def build_transcript_proposal_message(parsed_transcript: dict) -> str:
+    proposal = (
+        f"I found:\n"
+        f"- {len(parsed_transcript['tasks_to_create'])} tasks to create\n"
+        f"- {len(parsed_transcript['milestones'])} milestones\n"
+        f"- {len(parsed_transcript['recurring_meetings'])} recurring meetings\n\n"
+        "Proposed actions:\n"
+    )
+
+    if parsed_transcript["tasks_to_create"]:
+        for idx, task in enumerate(parsed_transcript["tasks_to_create"], start=1):
+            due_text = f", due {task['due_date']}" if task.get("due_date") else ""
+            priority_text = f", priority {task.get('priority') or 'medium'}"
+            proposal += (
+                f"{idx}. Create task for {task['assignee_name'] or 'Team'}: "
+                f"{task['title']}{due_text}{priority_text}\n"
+            )
+    else:
+        proposal += "No tasks are currently queued.\n"
+
+    proposal += (
+        "\nReply with:\n"
+        "- approve all\n"
+        "- approve 1,2,3\n"
+        "- reject 2\n"
+        "- edit 1 assignee Delali due Friday priority high"
+    )
+    return proposal
+
+
+def extract_transcript_edit_field(body: str, field_name: str) -> Optional[str]:
+    match = re.search(
+        rf"\b{field_name}\s+(.+?)(?=\s+(?:assignee|due|priority|title)\b|$)",
+        body,
+        flags=re.I,
+    )
+    if not match:
+        return None
+    value = match.group(1).strip(" .,")
+    return value or None
+
+
+def apply_transcript_task_edit(task: dict, edit_body: str) -> list[str]:
+    changes = []
+
+    assignee = extract_transcript_edit_field(edit_body, "assignee")
+    if assignee is not None:
+        task["assignee_name"] = assignee
+        task["assignee_user_id"] = None
+        changes.append(f"assignee {assignee}")
+
+    due_raw = extract_transcript_edit_field(edit_body, "due")
+    if due_raw is not None:
+        due_date = parse_due_date(due_raw)
+        task["due_date"] = due_date
+        changes.append(f"due {due_date or 'No due date'}")
+
+    priority = extract_transcript_edit_field(edit_body, "priority")
+    if priority is not None:
+        task["priority"] = PRIORITY_RATING_TO_LABEL.get(parse_priority(priority), "medium")
+        changes.append(f"priority {task['priority']}")
+
+    title = extract_transcript_edit_field(edit_body, "title")
+    if title is not None:
+        task["title"] = title
+        changes.append("title")
+
+    return changes
+
+
+def handle_transcript_approval(channel_id: str, text: str) -> Optional[dict]:
+    """Handle approval, reject, and edit commands for pending transcript actions."""
     if channel_id not in PENDING_TRANSCRIPT_ACTIONS:
         return None
 
     pending = PENDING_TRANSCRIPT_ACTIONS[channel_id]
     lower_text = text.lower().strip()
+    tasks = pending["tasks_to_create"]
 
     if lower_text == "approve all":
-        approved_tasks = pending["tasks_to_create"]
-        # For now, only handle tasks_to_create
-        return approved_tasks
+        return {"action": "approve", "tasks": list(tasks)}
 
     if lower_text.startswith("approve "):
-        indexes = lower_text.replace("approve ", "").split(",")
-        approved_tasks = []
-        for idx in indexes:
-            try:
-                idx = int(idx.strip()) - 1
-                if 0 <= idx < len(pending["tasks_to_create"]):
-                    approved_tasks.append(pending["tasks_to_create"][idx])
-            except ValueError:
-                pass
-        return approved_tasks
+        raw_indexes = text.strip()[len("approve "):]
+        indexes = parse_transcript_action_indexes(raw_indexes, len(tasks))
+        if not indexes:
+            return {"action": "message", "text": "I could not find any matching tasks to approve."}
+        approved_tasks = [tasks[index] for index in indexes]
+        return {"action": "approve", "tasks": approved_tasks}
+
+    if lower_text.startswith("reject "):
+        raw_indexes = text.strip()[len("reject "):]
+        indexes = parse_transcript_action_indexes(raw_indexes, len(tasks))
+        if not indexes:
+            return {"action": "message", "text": "I could not find any matching tasks to reject."}
+
+        rejected = [tasks[index]["title"] for index in indexes]
+        pending["tasks_to_create"] = [
+            task for index, task in enumerate(tasks) if index not in indexes
+        ]
+        return {
+            "action": "message",
+            "text": "Rejected:\n- " + "\n- ".join(rejected) + "\n\n" + build_transcript_proposal_message(pending),
+        }
+
+    edit_match = re.fullmatch(r"edit\s+(\d+)\s+(.+)", text.strip(), flags=re.I | re.S)
+    if edit_match:
+        index = int(edit_match.group(1)) - 1
+        if not 0 <= index < len(tasks):
+            return {"action": "message", "text": f"I could not find task {index + 1} to edit."}
+
+        changes = apply_transcript_task_edit(tasks[index], edit_match.group(2))
+        if not changes:
+            return {
+                "action": "message",
+                "text": "I did not find anything to edit. Try: edit 1 assignee Delali due Friday priority high",
+            }
+
+        return {
+            "action": "message",
+            "text": f"Updated task {index + 1}: {', '.join(changes)}\n\n" + build_transcript_proposal_message(pending),
+        }
 
     return None
 
@@ -1298,8 +1408,13 @@ async def slack_events(request: Request):
     text = (event.get("text") or "").strip()
 
     # Check for transcript approval commands
-    approved_tasks = handle_transcript_approval(dm_channel_id, text)
-    if approved_tasks is not None:
+    transcript_action = handle_transcript_approval(dm_channel_id, text)
+    if transcript_action is not None:
+        if transcript_action["action"] == "message":
+            post_dm(dm_channel_id, transcript_action["text"])
+            return JSONResponse({"ok": True})
+
+        approved_tasks = transcript_action["tasks"]
         if not approved_tasks:
             post_dm(dm_channel_id, "No tasks approved.")
             del PENDING_TRANSCRIPT_ACTIONS[dm_channel_id]
@@ -1343,24 +1458,11 @@ async def slack_events(request: Request):
         transcript_body = text
         for trigger in transcript_triggers:
             if trigger.lower() in transcript_body.lower():
-                transcript_body = transcript_body.lower().replace(trigger.lower(), "").strip()
+                transcript_body = re.sub(re.escape(trigger), "", transcript_body, count=1, flags=re.I).strip()
                 break
         parsed_transcript = parse_huddle_transcript(transcript_body)
         PENDING_TRANSCRIPT_ACTIONS[dm_channel_id] = parsed_transcript
-        # Build proposal message
-        proposal = f"I found:\n- {len(parsed_transcript['tasks_to_create'])} tasks to create\n- {len(parsed_transcript['milestones'])} milestones\n- {len(parsed_transcript['recurring_meetings'])} recurring meetings\n\nProposed actions:\n"
-        idx = 1
-        for task in parsed_transcript['tasks_to_create']:
-            proposal += f"{idx}. Create task for {task['assignee_name'] or 'Team'}: {task['title']}\n"
-            idx += 1
-        for milestone in parsed_transcript['milestones']:
-            proposal += f"{idx}. Milestone: {milestone}\n"
-            idx += 1
-        for meeting in parsed_transcript['recurring_meetings']:
-            proposal += f"{idx}. Recurring meeting: {meeting}\n"
-            idx += 1
-        proposal += "\nReply with:\n- approve all\n- approve 1,2,3"
-        post_dm(dm_channel_id, proposal)
+        post_dm(dm_channel_id, build_transcript_proposal_message(parsed_transcript))
         return JSONResponse({"ok": True})
 
     # Check for task status update commands

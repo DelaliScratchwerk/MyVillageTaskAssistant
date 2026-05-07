@@ -76,6 +76,15 @@ start DEV-0034
 block DEV-0031 waiting on API token
 ```
 
+Review huddle transcript proposals:
+
+```text
+approve all
+approve 1,3,5
+reject 2
+edit 1 assignee Delali due Friday priority high
+```
+
 ## Slack setup
 - Event Subscriptions: ON
 - Request URL: https://your-public-url/slack/events
