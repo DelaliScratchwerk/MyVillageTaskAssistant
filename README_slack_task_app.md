@@ -82,7 +82,7 @@ Review huddle transcript proposals:
 Process huddle notes:
 [paste huddle notes here]
 
-Or paste Slack AI huddle notes directly.
+Or paste Slack AI huddle notes, a huddle transcript, or both directly.
 
 approve all
 approve 1,3,5

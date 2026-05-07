@@ -412,6 +412,85 @@ def extract_assignee_name_from_action_item(item_text: str) -> str:
     return ""
 
 
+def is_likely_huddle_text(text: str) -> bool:
+    lower_text = text.lower()
+    if "huddle notes:" in lower_text or "huddle transcript" in lower_text:
+        return True
+    if "slack ai took notes" in lower_text and "action items" in lower_text:
+        return True
+    if "action items" in lower_text and "attendees" in lower_text:
+        return True
+    return False
+
+
+def clean_huddle_transcript_line(line: str) -> Optional[str]:
+    item_text = line.strip()
+    if not item_text:
+        return None
+
+    item_text = re.sub(r"^\[[0-9:]+\]\s*", "", item_text).strip()
+    speaker_match = re.match(r"^([A-Za-z][A-Za-z .'-]{1,80}):\s+(.+)$", item_text)
+    if speaker_match:
+        speaker = speaker_match.group(1).strip()
+        spoken_text = speaker_match.group(2).strip()
+        first_person_match = re.match(r"^(?:i|we)\s+(will|can|should|need to|have to|am going to|are going to)\s+(.+)$", spoken_text, flags=re.I)
+        if first_person_match:
+            item_text = f"{speaker} will {first_person_match.group(2).strip()}"
+        else:
+            item_text = spoken_text
+    item_text = item_text.strip("- ").strip()
+
+    if not item_text:
+        return None
+
+    ignored_fragments = (
+        "huddle notes:",
+        "huddle transcript",
+        "slack ai took notes",
+        "view huddle",
+        "attendees",
+        "summary",
+        "action items",
+        "this tool uses ai",
+    )
+    lowered = item_text.lower()
+    if any(fragment in lowered for fragment in ignored_fragments):
+        return None
+
+    action_patterns = (
+        r"@[^,\[]+?\s+will\s+",
+        r"@[^,\[]+?\s+to\s+",
+        r"\b[A-Z][A-Za-z .'-]{1,60}\s+will\s+",
+        r"\b[A-Z][A-Za-z .'-]{1,60}\s+to\s+",
+    )
+    if not any(re.search(pattern, item_text) for pattern in action_patterns):
+        return None
+
+    return item_text
+
+
+def add_huddle_task(
+    tasks_to_create: list[dict],
+    item_text: str,
+    project_name: str,
+    source: str,
+) -> None:
+    if any(task.get("source_excerpt") == item_text for task in tasks_to_create):
+        return
+
+    tasks_to_create.append({
+        "title": item_text,
+        "description": f"Source: Slack huddle notes\nProject: {project_name}\n\nOriginal action item:\n{item_text}",
+        "assignee_name": extract_assignee_name_from_action_item(item_text),
+        "assignee_user_id": None,
+        "due_date": None,
+        "priority": "medium",
+        "source": source,
+        "source_excerpt": item_text,
+        "project_name": project_name
+    })
+
+
 def parse_huddle_transcript(transcript: str) -> dict:
     """Parse a Slack huddle transcript into structured actions."""
     lines = transcript.split('\n')
@@ -466,20 +545,13 @@ def parse_huddle_transcript(transcript: str) -> dict:
             if 'by' in item_text.lower() and any(word in item_text.lower() for word in ['week', 'month', 'ready']):
                 milestones.append(item_text)
                 continue
-            # Extract assignee
-            assignee_name = extract_assignee_name_from_action_item(item_text)
-            # Create task
-            tasks_to_create.append({
-                "title": item_text,
-                "description": f"Source: Slack huddle notes\nProject: {project_name}\n\nOriginal action item:\n{item_text}",
-                "assignee_name": assignee_name,
-                "assignee_user_id": None,
-                "due_date": None,
-                "priority": "medium",
-                "source": "huddle_notes",
-                "source_excerpt": item_text,
-                "project_name": project_name
-            })
+            add_huddle_task(tasks_to_create, item_text, project_name, "huddle_notes")
+
+    if not tasks_to_create:
+        for line in lines:
+            item_text = clean_huddle_transcript_line(line)
+            if item_text is not None:
+                add_huddle_task(tasks_to_create, item_text, project_name, "huddle_transcript")
 
     return {
         "project_name": project_name,
@@ -1497,8 +1569,7 @@ async def slack_events(request: Request):
     transcript_triggers = ["Process huddle notes:", "Process transcript:", "Read these notes and make tasks:"]
     lower_text = text.lower()
     is_explicit_transcript_request = any(trigger.lower() in lower_text for trigger in transcript_triggers)
-    is_pasted_huddle_note = "huddle notes:" in lower_text and "action items" in lower_text
-    is_transcript_request = is_explicit_transcript_request or is_pasted_huddle_note
+    is_transcript_request = is_explicit_transcript_request or is_likely_huddle_text(text)
     if is_transcript_request:
         transcript_body = text
         for trigger in transcript_triggers:
