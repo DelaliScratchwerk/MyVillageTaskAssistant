@@ -49,6 +49,17 @@ If `TASK_API_KEY` is enabled in `.env`:
 curl -H "X-API-Key: your_key" http://127.0.0.1:8000/tasks
 ```
 
+## Due-date reminders
+The app sends a morning DM to task assignees for open tasks that are due tomorrow or overdue.
+
+Optional `.env` values:
+
+```bash
+APP_TIMEZONE=America/New_York
+TASK_REMINDER_HOUR=8
+TASK_REMINDER_MINUTE=0
+```
+
 ## Slack setup
 - Event Subscriptions: ON
 - Request URL: https://your-public-url/slack/events

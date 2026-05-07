@@ -27,15 +27,20 @@ logger = logging.getLogger("slack-task-app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    reminder_task = asyncio.create_task(invoice_reminder_loop())
+    background_tasks = [
+        asyncio.create_task(invoice_reminder_loop()),
+        asyncio.create_task(task_due_reminder_loop()),
+    ]
     try:
         yield
     finally:
-        reminder_task.cancel()
-        try:
-            await reminder_task
-        except asyncio.CancelledError:
-            pass
+        for task in background_tasks:
+            task.cancel()
+        for task in background_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Slack Task App", lifespan=lifespan)
@@ -850,6 +855,138 @@ def next_invoice_reminder_time(now: datetime) -> datetime:
             return candidate
 
         candidate_day = candidate_day + timedelta(days=1)
+
+
+def get_task_reminder_hour() -> int:
+    raw_hour = os.getenv("TASK_REMINDER_HOUR", "8").strip()
+    try:
+        hour = int(raw_hour)
+    except ValueError:
+        logger.warning("Invalid TASK_REMINDER_HOUR=%s, falling back to 8", raw_hour)
+        return 8
+    if 0 <= hour <= 23:
+        return hour
+    logger.warning("Invalid TASK_REMINDER_HOUR=%s, falling back to 8", raw_hour)
+    return 8
+
+
+def get_task_reminder_minute() -> int:
+    raw_minute = os.getenv("TASK_REMINDER_MINUTE", "0").strip()
+    try:
+        minute = int(raw_minute)
+    except ValueError:
+        logger.warning("Invalid TASK_REMINDER_MINUTE=%s, falling back to 0", raw_minute)
+        return 0
+    if 0 <= minute <= 59:
+        return minute
+    logger.warning("Invalid TASK_REMINDER_MINUTE=%s, falling back to 0", raw_minute)
+    return 0
+
+
+def next_daily_task_reminder_time(now: datetime) -> datetime:
+    candidate = datetime.combine(
+        now.date(),
+        time(hour=get_task_reminder_hour(), minute=get_task_reminder_minute()),
+        tzinfo=now.tzinfo,
+    )
+    if candidate <= now:
+        candidate = candidate + timedelta(days=1)
+    return candidate
+
+
+def parse_task_due_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        logger.warning("Skipping task with invalid due_date=%s", value)
+        return None
+
+
+def is_done_task(task: dict) -> bool:
+    return str(task.get("status") or "").strip().lower() == "done"
+
+
+def get_task_due_reminder_label(due_date: date, today: date) -> Optional[str]:
+    if due_date == today + timedelta(days=1):
+        return "is due tomorrow"
+    if due_date < today:
+        return f"was due {due_date.isoformat()}"
+    return None
+
+
+def build_task_due_reminder_message(task: dict, due_date: date, today: date) -> Optional[str]:
+    reminder_label = get_task_due_reminder_label(due_date, today)
+    if reminder_label is None:
+        return None
+
+    task_id = str(task.get("task_id") or "Task").strip()
+    title = str(task.get("title") or "Untitled task").strip()
+    return f"Reminder: {task_id} {reminder_label} - {title}"
+
+
+def get_tasks_due_for_reminder(today: date) -> list[tuple[dict, date]]:
+    settings = get_settings()
+    rows = fetch_all_slack_list_rows()
+    tasks = [normalize_task_row(row, settings) for row in rows]
+    reminders = []
+
+    for task in tasks:
+        if is_done_task(task):
+            continue
+        if not task.get("assignee"):
+            continue
+
+        due_date = parse_task_due_date(task.get("due_date"))
+        if due_date is None:
+            continue
+        if get_task_due_reminder_label(due_date, today) is None:
+            continue
+
+        reminders.append((task, due_date))
+
+    reminders.sort(key=lambda item: (item[1], _parse_task_sort_key(item[0])))
+    return reminders
+
+
+def send_task_due_reminders(today: date) -> int:
+    sent_count = 0
+    for task, due_date in get_tasks_due_for_reminder(today):
+        message = build_task_due_reminder_message(task, due_date, today)
+        if message is None:
+            continue
+        post_dm_to_user(str(task["assignee"]), message)
+        sent_count += 1
+    return sent_count
+
+
+async def task_due_reminder_loop() -> None:
+    while True:
+        try:
+            tz = get_app_timezone()
+            now = datetime.now(tz)
+            next_run = next_daily_task_reminder_time(now)
+
+            sleep_seconds = (next_run - now).total_seconds()
+            logger.info("Next task due reminder scheduled for %s", next_run.isoformat())
+
+            await asyncio.sleep(sleep_seconds)
+
+            reminder_day = datetime.now(tz).date()
+            sent_count = send_task_due_reminders(reminder_day)
+
+            logger.info("Sent %s task due reminders", sent_count)
+
+            # Prevent accidental double-send if the loop wakes up again within the same minute
+            await asyncio.sleep(60)
+
+        except asyncio.CancelledError:
+            logger.info("Task due reminder loop cancelled")
+            raise
+        except Exception:
+            logger.exception("Task due reminder loop failed")
+            await asyncio.sleep(60)
 
 
 async def invoice_reminder_loop() -> None:
