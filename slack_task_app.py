@@ -677,6 +677,71 @@ def parse_status(raw: Optional[str]) -> str:
     return mapping.get(value, default_status)
 
 
+def get_status_label_for_option_id(option_id: str) -> str:
+    settings = get_settings()
+    mapping = {
+        settings["OPT_STATUS_NOT_STARTED"]: "Not started",
+        settings["OPT_STATUS_IN_PROGRESS"]: "In progress",
+        settings["OPT_STATUS_BLOCKED"]: "Blocked",
+        settings["OPT_STATUS_DONE"]: "Done",
+    }
+    return mapping.get(option_id, STATUS_OPTION_TO_LABEL.get(option_id, option_id))
+
+
+def find_task_by_task_id(task_id: str) -> Optional[dict]:
+    settings = get_settings()
+    normalized_task_id = task_id.strip().lower()
+    rows = fetch_all_slack_list_rows()
+    tasks = [normalize_task_row(row, settings) for row in rows]
+    return next(
+        (task for task in tasks if task.get("task_id", "").strip().lower() == normalized_task_id),
+        None,
+    )
+
+
+def parse_status_update_message(text: str) -> Optional[Dict[str, Any]]:
+    match = re.fullmatch(
+        r"(done|complete|completed|start|started|block|blocked)\s+([A-Za-z]+-\d+)(?:\s+(.+))?",
+        text.strip(),
+        flags=re.I,
+    )
+    if not match:
+        return None
+
+    command = match.group(1).lower()
+    task_id = match.group(2).upper()
+    note = (match.group(3) or "").strip()
+
+    if command in {"done", "complete", "completed"}:
+        status_label = "done"
+    elif command in {"start", "started"}:
+        status_label = "in progress"
+    else:
+        status_label = "blocked"
+
+    return {
+        "task_id": task_id,
+        "status_label": status_label,
+        "status_option_id": parse_status(status_label),
+        "note": note,
+    }
+
+
+def parse_status_update_messages(text: str) -> Optional[list[Dict[str, Any]]]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    updates = []
+    for line in lines:
+        update = parse_status_update_message(line)
+        if update is None:
+            return None
+        updates.append(update)
+
+    return updates
+
+
 def parse_create_task_message(text: str) -> Dict[str, Any]:
     """Simple rule-based parser.
 
@@ -800,6 +865,57 @@ def create_slack_list_item(
     )
     response.validate()
     return response.data
+
+
+def update_slack_list_item_cells(row_id: str, cells: list[dict]) -> Dict[str, Any]:
+    settings = get_settings()
+    cells_with_row_id = []
+    for cell in cells:
+        updated_cell = dict(cell)
+        updated_cell["row_id"] = row_id
+        cells_with_row_id.append(updated_cell)
+
+    response = get_lists_client().api_call(
+        api_method="slackLists.items.update",
+        json={
+            "list_id": settings["SLACK_LIST_ID"],
+            "cells": cells_with_row_id,
+        },
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    response.validate()
+    return response.data
+
+
+def build_blocked_description(existing_description: str, note: str, sender_user_id: str) -> str:
+    if not note:
+        return existing_description
+
+    today = date.today().isoformat()
+    block_note = f"Blocked by <@{sender_user_id}> on {today}: {note}"
+    if not existing_description:
+        return block_note
+    return f"{existing_description}\n\n{block_note}"
+
+
+def update_task_status(task: dict, status_option_id: str, note: str, sender_user_id: str) -> None:
+    settings = get_settings()
+    cells = [
+        {
+            "column_id": settings["COL_STATUS"],
+            "select": [status_option_id],
+        }
+    ]
+
+    if status_option_id == settings["OPT_STATUS_BLOCKED"] and note:
+        cells.append(
+            rich_text_field(
+                settings["COL_DESCRIPTION"],
+                build_blocked_description(task.get("description") or "", note, sender_user_id),
+            )
+        )
+
+    update_slack_list_item_cells(task["row_id"], cells)
 
 
 def post_dm(channel_id: str, text: str) -> None:
@@ -1245,6 +1361,38 @@ async def slack_events(request: Request):
             idx += 1
         proposal += "\nReply with:\n- approve all\n- approve 1,2,3"
         post_dm(dm_channel_id, proposal)
+        return JSONResponse({"ok": True})
+
+    # Check for task status update commands
+    status_updates = parse_status_update_messages(text)
+    if status_updates is not None:
+        confirmations = []
+        for status_update in status_updates:
+            task = find_task_by_task_id(status_update["task_id"])
+            if task is None:
+                post_dm(dm_channel_id, f"⚠️ I couldn't find task {status_update['task_id']}.")
+                return JSONResponse({"ok": True})
+
+            try:
+                update_task_status(
+                    task=task,
+                    status_option_id=status_update["status_option_id"],
+                    note=status_update["note"],
+                    sender_user_id=sender_user_id,
+                )
+            except SlackApiError as e:
+                error = e.response.get("error", "unknown_error")
+                logger.exception("Slack Lists status update failed")
+                post_dm(dm_channel_id, f"❌ I couldn't update {status_update['task_id']}. Slack returned: {error}")
+                return JSONResponse({"ok": True})
+
+            status_label = get_status_label_for_option_id(status_update["status_option_id"])
+            note_text = f" Note: {status_update['note']}" if status_update["note"] else ""
+            confirmations.append(
+                f"✅ Updated {status_update['task_id']} to {status_label}: {task['title']}{note_text}"
+            )
+
+        post_dm(dm_channel_id, "\n".join(confirmations))
         return JSONResponse({"ok": True})
 
     # Normal task creation

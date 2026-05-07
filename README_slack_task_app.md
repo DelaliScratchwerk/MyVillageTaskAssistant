@@ -60,6 +60,22 @@ TASK_REMINDER_HOUR=8
 TASK_REMINDER_MINUTE=0
 ```
 
+## Slack DM commands
+Create a task by DMing the app:
+
+```text
+Create task: build Slack tool, due Friday
+Create task: fix API auth. Priority high. Due tomorrow.
+```
+
+Update task status by task ID:
+
+```text
+done DEV-0038
+start DEV-0034
+block DEV-0031 waiting on API token
+```
+
 ## Slack setup
 - Event Subscriptions: ON
 - Request URL: https://your-public-url/slack/events
