@@ -368,6 +368,50 @@ def get_next_task_id() -> str:
     return f"{prefix}-{highest + 1:04d}"
 
 
+def clean_huddle_action_item_line(line: str) -> Optional[str]:
+    item_text = line.strip()
+    if not item_text:
+        return None
+
+    if item_text.startswith("-"):
+        item_text = item_text[1:].strip()
+
+    item_text = re.sub(r"^\[\s*[-xX]?\s*\]\s*", "", item_text).strip()
+    item_text = item_text.strip("- ").strip()
+
+    if not item_text:
+        return None
+
+    ignored_prefixes = (
+        "this tool uses ai",
+        "huddle transcript",
+        "thread in ",
+        "view message",
+        "canvas",
+    )
+    if item_text.lower().startswith(ignored_prefixes):
+        return None
+
+    if not item_text.startswith("@") and " to " not in item_text.lower():
+        return None
+
+    return item_text
+
+
+def extract_assignee_name_from_action_item(item_text: str) -> str:
+    mention_match = re.search(r"@([^,\[]+?)(?:\s+to\s+|\s+will\s+|$)", item_text)
+    if mention_match:
+        return mention_match.group(1).strip()
+
+    if " will " in item_text:
+        return item_text.split(" will ", 1)[0].strip()
+
+    if " to " in item_text:
+        return item_text.split(" to ", 1)[0].strip()
+
+    return ""
+
+
 def parse_huddle_transcript(transcript: str) -> dict:
     """Parse a Slack huddle transcript into structured actions."""
     lines = transcript.split('\n')
@@ -404,8 +448,13 @@ def parse_huddle_transcript(transcript: str) -> dict:
         if ':white_check_mark:' in line or 'Action items' in line:
             in_action_items = True
             continue
-        if in_action_items and line.strip().startswith('-'):
-            item_text = line.strip()[1:].strip()
+        if in_action_items:
+            item_text = clean_huddle_action_item_line(line)
+            if item_text is None:
+                if line.strip().lower().startswith("this tool uses ai"):
+                    in_action_items = False
+                continue
+
             if any(word in item_text.lower() for word in ['product overview', 'technical features', 'administrative functionality']):
                 ignored_notes.append(item_text)
                 continue
@@ -418,12 +467,7 @@ def parse_huddle_transcript(transcript: str) -> dict:
                 milestones.append(item_text)
                 continue
             # Extract assignee
-            assignee_name = ""
-            match = re.search(r'@(\w+)', item_text)
-            if match:
-                assignee_name = match.group(1)
-            elif 'will' in item_text:
-                assignee_name = item_text.split(' will')[0].strip()
+            assignee_name = extract_assignee_name_from_action_item(item_text)
             # Create task
             tasks_to_create.append({
                 "title": item_text,
@@ -436,8 +480,6 @@ def parse_huddle_transcript(transcript: str) -> dict:
                 "source_excerpt": item_text,
                 "project_name": project_name
             })
-        elif in_action_items and line.strip() and not line.startswith(' '):
-            in_action_items = False
 
     return {
         "project_name": project_name,
@@ -1453,7 +1495,10 @@ async def slack_events(request: Request):
 
     # Check for transcript processing requests
     transcript_triggers = ["Process huddle notes:", "Process transcript:", "Read these notes and make tasks:"]
-    is_transcript_request = any(trigger.lower() in text.lower() for trigger in transcript_triggers)
+    lower_text = text.lower()
+    is_explicit_transcript_request = any(trigger.lower() in lower_text for trigger in transcript_triggers)
+    is_pasted_huddle_note = "huddle notes:" in lower_text and "action items" in lower_text
+    is_transcript_request = is_explicit_transcript_request or is_pasted_huddle_note
     if is_transcript_request:
         transcript_body = text
         for trigger in transcript_triggers:

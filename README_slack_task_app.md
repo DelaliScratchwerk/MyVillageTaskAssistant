@@ -79,6 +79,11 @@ block DEV-0031 waiting on API token
 Review huddle transcript proposals:
 
 ```text
+Process huddle notes:
+[paste huddle notes here]
+
+Or paste Slack AI huddle notes directly.
+
 approve all
 approve 1,3,5
 reject 2
