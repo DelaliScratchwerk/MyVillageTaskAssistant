@@ -118,6 +118,33 @@ def get_team_user_map() -> Dict[str, str]:
         logger.warning("Invalid TEAM_USER_MAP_JSON, falling back to empty map")
         return {}
 
+
+@lru_cache()
+def get_channel_list_map() -> Dict[str, str]:
+    raw = os.getenv("CHANNEL_LIST_MAP_JSON", "{}")
+    raw = raw.strip()
+    if raw.startswith("'") and raw.endswith("'"):
+        raw = raw[1:-1].strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1].strip()
+    try:
+        mapping = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid CHANNEL_LIST_MAP_JSON, falling back to default list")
+        return {}
+    if not isinstance(mapping, dict):
+        logger.warning("CHANNEL_LIST_MAP_JSON must be an object, falling back to default list")
+        return {}
+    return {str(channel_id): str(list_id) for channel_id, list_id in mapping.items() if channel_id and list_id}
+
+
+def get_list_id_for_channel(channel_id: Optional[str] = None) -> str:
+    settings = get_settings()
+    if not channel_id:
+        return settings["SLACK_LIST_ID"]
+    return get_channel_list_map().get(channel_id, settings["SLACK_LIST_ID"])
+
+
 def is_dynamic_user_lookup_enabled() -> bool:
     return os.getenv("ENABLE_DYNAMIC_USER_LOOKUP", "false").lower() == "true"
 
@@ -184,11 +211,11 @@ def fetch_list_rows(list_id: str) -> list:
     return data.get("records") or data.get("items") or []
 
 
-def fetch_all_slack_list_rows() -> list:
+def fetch_all_slack_list_rows(list_id: Optional[str] = None) -> list:
     settings = get_settings()
     response = get_lists_client().api_call(
         api_method="slackLists.items.list",
-        json={"list_id": settings["SLACK_LIST_ID"]},
+        json={"list_id": list_id or settings["SLACK_LIST_ID"]},
     )
     response.validate()
     data = response.data
@@ -344,14 +371,14 @@ class TaskCreateRequest(BaseModel):
     created_by: Optional[str] = None
 
 
-def get_next_task_id() -> str:
+def get_next_task_id(list_id: Optional[str] = None) -> str:
     settings = get_settings()
     prefix = settings.get("TASK_ID_PREFIX", "DEV")
     escaped_prefix = re.escape(prefix)
     pattern = re.compile(rf"^{escaped_prefix}-(\d{{4}})$")
     highest = 0
 
-    for row in fetch_list_rows(settings["SLACK_LIST_ID"]):
+    for row in fetch_list_rows(list_id or settings["SLACK_LIST_ID"]):
         for field in row.get("fields", []):
             if field.get("column_id") != settings["COL_TASK_ID"]:
                 continue
@@ -912,15 +939,19 @@ def get_status_label_for_option_id(option_id: str) -> str:
     return mapping.get(option_id, STATUS_OPTION_TO_LABEL.get(option_id, option_id))
 
 
-def find_task_by_task_id(task_id: str) -> Optional[dict]:
+def find_task_by_task_id(task_id: str, list_id: Optional[str] = None) -> Optional[dict]:
     settings = get_settings()
     normalized_task_id = task_id.strip().lower()
-    rows = fetch_all_slack_list_rows()
+    resolved_list_id = list_id or settings["SLACK_LIST_ID"]
+    rows = fetch_all_slack_list_rows(resolved_list_id)
     tasks = [normalize_task_row(row, settings) for row in rows]
-    return next(
+    task = next(
         (task for task in tasks if task.get("task_id", "").strip().lower() == normalized_task_id),
         None,
     )
+    if task is not None:
+        task["list_id"] = resolved_list_id
+    return task
 
 
 def parse_status_update_message(text: str) -> Optional[Dict[str, Any]]:
@@ -1038,6 +1069,7 @@ def create_slack_list_item(
     priority_rating: int,
     status_option_id: str,
     task_id: Optional[str] = None,
+    list_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     settings = get_settings()
     initial_fields = [
@@ -1082,7 +1114,7 @@ def create_slack_list_item(
     response = get_lists_client().api_call(
         api_method="slackLists.items.create",
         json={
-            "list_id": settings["SLACK_LIST_ID"],
+            "list_id": list_id or settings["SLACK_LIST_ID"],
             "initial_fields": initial_fields,
         },
         headers={"Content-Type": "application/json; charset=utf-8"},
@@ -1091,7 +1123,7 @@ def create_slack_list_item(
     return response.data
 
 
-def update_slack_list_item_cells(row_id: str, cells: list[dict]) -> Dict[str, Any]:
+def update_slack_list_item_cells(row_id: str, cells: list[dict], list_id: Optional[str] = None) -> Dict[str, Any]:
     settings = get_settings()
     cells_with_row_id = []
     for cell in cells:
@@ -1102,7 +1134,7 @@ def update_slack_list_item_cells(row_id: str, cells: list[dict]) -> Dict[str, An
     response = get_lists_client().api_call(
         api_method="slackLists.items.update",
         json={
-            "list_id": settings["SLACK_LIST_ID"],
+            "list_id": list_id or settings["SLACK_LIST_ID"],
             "cells": cells_with_row_id,
         },
         headers={"Content-Type": "application/json; charset=utf-8"},
@@ -1122,7 +1154,13 @@ def build_blocked_description(existing_description: str, note: str, sender_user_
     return f"{existing_description}\n\n{block_note}"
 
 
-def update_task_status(task: dict, status_option_id: str, note: str, sender_user_id: str) -> None:
+def update_task_status(
+    task: dict,
+    status_option_id: str,
+    note: str,
+    sender_user_id: str,
+    list_id: Optional[str] = None,
+) -> None:
     settings = get_settings()
     cells = [
         {
@@ -1139,16 +1177,23 @@ def update_task_status(task: dict, status_option_id: str, note: str, sender_user
             )
         )
 
-    update_slack_list_item_cells(task["row_id"], cells)
+    update_slack_list_item_cells(task["row_id"], cells, list_id or task.get("list_id"))
+
+
+def post_message(channel_id: str, text: str, thread_ts: Optional[str] = None) -> None:
+    kwargs = {"channel": channel_id, "text": text}
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
+    try:
+        get_bot_client().chat_postMessage(**kwargs)
+    except SlackApiError as e:
+        logger.error("Unable to send message to Slack: %s", e.response.get('error'))
+    except Exception as e:
+        logger.error("Unexpected error sending message to Slack: %s", e)
 
 
 def post_dm(channel_id: str, text: str) -> None:
-    try:
-        get_bot_client().chat_postMessage(channel=channel_id, text=text)
-    except SlackApiError as e:
-        logger.error("Unable to send DM to Slack: %s", e.response.get('error'))
-    except Exception as e:
-        logger.error("Unexpected error sending DM to Slack: %s", e)
+    post_message(channel_id, text)
 
 
 def post_dm_to_user(user_id: str, text: str) -> None:
@@ -1480,6 +1525,180 @@ async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_
     }
 
 
+def strip_leading_app_mention(text: str) -> str:
+    return re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text, count=1).strip()
+
+
+async def handle_task_assistant_message(
+    *,
+    sender_user_id: str,
+    response_channel_id: str,
+    text: str,
+    list_id: str,
+    thread_ts: Optional[str] = None,
+) -> JSONResponse:
+    # Check for transcript approval commands
+    transcript_action = handle_transcript_approval(response_channel_id, text)
+    if transcript_action is not None:
+        if transcript_action["action"] == "message":
+            post_message(response_channel_id, transcript_action["text"], thread_ts)
+            return JSONResponse({"ok": True})
+
+        approved_tasks = transcript_action["tasks"]
+        if not approved_tasks:
+            post_message(response_channel_id, "No tasks approved.", thread_ts)
+            del PENDING_TRANSCRIPT_ACTIONS[response_channel_id]
+            return JSONResponse({"ok": True})
+        # Create approved tasks
+        created_count = 0
+        for task in approved_tasks:
+            assignee_user_id = resolve_user_id(task["assignee_name"], sender_user_id)
+            if assignee_user_id is None:
+                assignee_user_id = sender_user_id
+            priority_rating = parse_priority(task["priority"])
+            status_option_id = get_settings()["OPT_STATUS_NOT_STARTED"]
+            try:
+                async with TASK_ID_LOCK:
+                    next_task_id = get_next_task_id(list_id)
+                    create_slack_list_item(
+                        title=task["title"],
+                        description=task["description"],
+                        sender_user_id=sender_user_id,
+                        assignee_user_id=assignee_user_id,
+                        due_date=task["due_date"],
+                        priority_rating=priority_rating,
+                        status_option_id=status_option_id,
+                        task_id=next_task_id,
+                        list_id=list_id,
+                    )
+                post_dm_to_user(
+                    assignee_user_id,
+                    f"📌 A new task has been assigned to you: *{task['title']}*\nTask ID: {next_task_id}\nDue: {task['due_date'] or 'No due date'}\nPriority: {task['priority'] or 'medium'}"
+                )
+                created_count += 1
+            except SlackApiError:
+                logger.exception("Failed to create task from transcript")
+        post_message(response_channel_id, f"✅ Created {created_count} tasks from transcript.", thread_ts)
+        del PENDING_TRANSCRIPT_ACTIONS[response_channel_id]
+        return JSONResponse({"ok": True})
+
+    # Check for transcript processing requests
+    transcript_triggers = ["Process huddle notes:", "Process transcript:", "Read these notes and make tasks:"]
+    lower_text = text.lower()
+    is_explicit_transcript_request = any(trigger.lower() in lower_text for trigger in transcript_triggers)
+    is_transcript_request = is_explicit_transcript_request or is_likely_huddle_text(text)
+    if is_transcript_request:
+        transcript_body = text
+        for trigger in transcript_triggers:
+            if trigger.lower() in transcript_body.lower():
+                transcript_body = re.sub(re.escape(trigger), "", transcript_body, count=1, flags=re.I).strip()
+                break
+        parsed_transcript = parse_huddle_transcript(transcript_body)
+        PENDING_TRANSCRIPT_ACTIONS[response_channel_id] = parsed_transcript
+        post_message(response_channel_id, build_transcript_proposal_message(parsed_transcript), thread_ts)
+        return JSONResponse({"ok": True})
+
+    # Check for task status update commands
+    status_updates = parse_status_update_messages(text)
+    if status_updates is not None:
+        confirmations = []
+        for status_update in status_updates:
+            task = find_task_by_task_id(status_update["task_id"], list_id)
+            if task is None:
+                post_message(response_channel_id, f"⚠️ I couldn't find task {status_update['task_id']}.", thread_ts)
+                return JSONResponse({"ok": True})
+
+            try:
+                update_task_status(
+                    task=task,
+                    status_option_id=status_update["status_option_id"],
+                    note=status_update["note"],
+                    sender_user_id=sender_user_id,
+                    list_id=list_id,
+                )
+            except SlackApiError as e:
+                error = e.response.get("error", "unknown_error")
+                logger.exception("Slack Lists status update failed")
+                post_message(response_channel_id, f"❌ I couldn't update {status_update['task_id']}. Slack returned: {error}", thread_ts)
+                return JSONResponse({"ok": True})
+
+            status_label = get_status_label_for_option_id(status_update["status_option_id"])
+            note_text = f" Note: {status_update['note']}" if status_update["note"] else ""
+            confirmations.append(
+                f"✅ Updated {status_update['task_id']} to {status_label}: {task['title']}{note_text}"
+            )
+
+        post_message(response_channel_id, "\n".join(confirmations), thread_ts)
+        return JSONResponse({"ok": True})
+
+    # Normal task creation
+    parsed = parse_create_task_message(text)
+    if not parsed["ok"]:
+        post_message(
+            response_channel_id,
+            f"⚠️ {parsed['error']}\n\nTry something like:\n"
+            "Create task: build Slack tool, due Friday\n"
+            "Create task: fix API auth. Priority high. Due tomorrow.",
+            thread_ts,
+        )
+        return JSONResponse({"ok": True})
+
+    assignee_user_id = resolve_user_id(parsed["assignee_name"], sender_user_id)
+    if assignee_user_id is None:
+        post_message(
+            response_channel_id,
+            f'⚠️ I could not find a team member named "{parsed["assignee_name"]}". '
+            "Please try again with a valid team member name or omit the assignee to assign it to yourself.",
+            thread_ts,
+        )
+        return JSONResponse({"ok": True})
+
+    if not parsed["status_option_id"]:
+        parsed["status_option_id"] = get_settings()["OPT_STATUS_NOT_STARTED"]
+
+    try:
+        async with TASK_ID_LOCK:
+            next_task_id = get_next_task_id(list_id)
+            created = create_slack_list_item(
+                title=parsed["title"],
+                description=parsed["description"],
+                sender_user_id=sender_user_id,
+                assignee_user_id=assignee_user_id,
+                due_date=parsed["due_date"],
+                priority_rating=parsed["priority_rating"],
+                status_option_id=parsed["status_option_id"],
+                task_id=next_task_id,
+                list_id=list_id,
+            )
+    except SlackApiError as e:
+        error = e.response.get("error", "unknown_error")
+        logger.exception("Slack Lists create failed")
+        post_message(
+            response_channel_id,
+            f"❌ I couldn't create the task. Slack returned: {error}",
+            thread_ts,
+        )
+        return JSONResponse({"ok": True})
+
+    row_id = created.get("item", {}).get("id") or created.get("id") or created.get("row_id") or "unknown"
+    confirmation_text = (
+        f"✅ Task created successfully. Task ID: {next_task_id}\n\n"
+        f"Title: {parsed['title']}\n"
+        f"Assignee: <@{assignee_user_id}>\n"
+        f"Due: {parsed['due_date'] or 'No due date'}\n"
+        f"Priority: {parsed['priority_label']}\n"
+        f"Row ID: {row_id}"
+    )
+    post_message(response_channel_id, confirmation_text, thread_ts)
+
+    post_dm_to_user(
+        assignee_user_id,
+        f"📌 A new task has been assigned to you: *{parsed['title']}*\nTask ID: {next_task_id}\nDue: {parsed['due_date'] or 'No due date'}\nPriority: {PRIORITY_RATING_TO_LABEL.get(parsed['priority_rating'], 'medium')}"
+    )
+
+    return JSONResponse({"ok": True})
+
+
 @app.post("/slack/events")
 async def slack_events(request: Request):
     raw_body = await request.body()
@@ -1509,169 +1728,30 @@ async def slack_events(request: Request):
     if not event:
         return JSONResponse({"ok": True})
 
-    # Only handle new DMs to the app
-    if event.get("type") != "message" or event.get("channel_type") != "im":
-        return JSONResponse({"ok": True})
-
-    # Ignore bot messages, edits, and messages without a user
+    # Ignore bot messages, edits, and messages without a user.
     if event.get("bot_id") or event.get("subtype") or not event.get("user"):
         return JSONResponse({"ok": True})
 
     sender_user_id = event["user"]
-    dm_channel_id = event["channel"]
+    event_type = event.get("type")
+    channel_id = event.get("channel")
     text = (event.get("text") or "").strip()
 
-    # Check for transcript approval commands
-    transcript_action = handle_transcript_approval(dm_channel_id, text)
-    if transcript_action is not None:
-        if transcript_action["action"] == "message":
-            post_dm(dm_channel_id, transcript_action["text"])
-            return JSONResponse({"ok": True})
-
-        approved_tasks = transcript_action["tasks"]
-        if not approved_tasks:
-            post_dm(dm_channel_id, "No tasks approved.")
-            del PENDING_TRANSCRIPT_ACTIONS[dm_channel_id]
-            return JSONResponse({"ok": True})
-        # Create approved tasks
-        created_count = 0
-        for task in approved_tasks:
-            assignee_user_id = resolve_user_id(task["assignee_name"], sender_user_id)
-            if assignee_user_id is None:
-                assignee_user_id = sender_user_id
-            priority_rating = parse_priority(task["priority"])
-            status_option_id = get_settings()["OPT_STATUS_NOT_STARTED"]
-            try:
-                async with TASK_ID_LOCK:
-                    next_task_id = get_next_task_id()
-                    create_slack_list_item(
-                        title=task["title"],
-                        description=task["description"],
-                        sender_user_id=sender_user_id,
-                        assignee_user_id=assignee_user_id,
-                        due_date=task["due_date"],
-                        priority_rating=priority_rating,
-                        status_option_id=status_option_id,
-                        task_id=next_task_id,
-                    )
-                post_dm_to_user(
-                    assignee_user_id,
-                    f"📌 A new task has been assigned to you: *{task['title']}*\nTask ID: {next_task_id}\nDue: {task['due_date'] or 'No due date'}\nPriority: {task['priority'] or 'medium'}"
-                )
-                created_count += 1
-            except SlackApiError as e:
-                logger.exception("Failed to create task from transcript")
-        post_dm(dm_channel_id, f"✅ Created {created_count} tasks from transcript.")
-        del PENDING_TRANSCRIPT_ACTIONS[dm_channel_id]
-        return JSONResponse({"ok": True})
-
-    # Check for transcript processing requests
-    transcript_triggers = ["Process huddle notes:", "Process transcript:", "Read these notes and make tasks:"]
-    lower_text = text.lower()
-    is_explicit_transcript_request = any(trigger.lower() in lower_text for trigger in transcript_triggers)
-    is_transcript_request = is_explicit_transcript_request or is_likely_huddle_text(text)
-    if is_transcript_request:
-        transcript_body = text
-        for trigger in transcript_triggers:
-            if trigger.lower() in transcript_body.lower():
-                transcript_body = re.sub(re.escape(trigger), "", transcript_body, count=1, flags=re.I).strip()
-                break
-        parsed_transcript = parse_huddle_transcript(transcript_body)
-        PENDING_TRANSCRIPT_ACTIONS[dm_channel_id] = parsed_transcript
-        post_dm(dm_channel_id, build_transcript_proposal_message(parsed_transcript))
-        return JSONResponse({"ok": True})
-
-    # Check for task status update commands
-    status_updates = parse_status_update_messages(text)
-    if status_updates is not None:
-        confirmations = []
-        for status_update in status_updates:
-            task = find_task_by_task_id(status_update["task_id"])
-            if task is None:
-                post_dm(dm_channel_id, f"⚠️ I couldn't find task {status_update['task_id']}.")
-                return JSONResponse({"ok": True})
-
-            try:
-                update_task_status(
-                    task=task,
-                    status_option_id=status_update["status_option_id"],
-                    note=status_update["note"],
-                    sender_user_id=sender_user_id,
-                )
-            except SlackApiError as e:
-                error = e.response.get("error", "unknown_error")
-                logger.exception("Slack Lists status update failed")
-                post_dm(dm_channel_id, f"❌ I couldn't update {status_update['task_id']}. Slack returned: {error}")
-                return JSONResponse({"ok": True})
-
-            status_label = get_status_label_for_option_id(status_update["status_option_id"])
-            note_text = f" Note: {status_update['note']}" if status_update["note"] else ""
-            confirmations.append(
-                f"✅ Updated {status_update['task_id']} to {status_label}: {task['title']}{note_text}"
-            )
-
-        post_dm(dm_channel_id, "\n".join(confirmations))
-        return JSONResponse({"ok": True})
-
-    # Normal task creation
-    parsed = parse_create_task_message(text)
-    if not parsed["ok"]:
-        post_dm(
-            dm_channel_id,
-            f"⚠️ {parsed['error']}\n\nTry something like:\n"
-            "Create task: build Slack tool, due Friday\n"
-            "Create task: fix API auth. Priority high. Due tomorrow.",
+    if event_type == "message" and event.get("channel_type") == "im":
+        return await handle_task_assistant_message(
+            sender_user_id=sender_user_id,
+            response_channel_id=channel_id,
+            text=text,
+            list_id=get_list_id_for_channel(),
         )
-        return JSONResponse({"ok": True})
 
-    assignee_user_id = resolve_user_id(parsed["assignee_name"], sender_user_id)
-    if assignee_user_id is None:
-        post_dm(
-            dm_channel_id,
-            f'⚠️ I could not find a team member named "{parsed["assignee_name"]}". '
-            "Please try again with a valid team member name or omit the assignee to assign it to yourself.",
+    if event_type == "app_mention" and channel_id:
+        return await handle_task_assistant_message(
+            sender_user_id=sender_user_id,
+            response_channel_id=channel_id,
+            text=strip_leading_app_mention(text),
+            list_id=get_list_id_for_channel(channel_id),
+            thread_ts=event.get("thread_ts") or event.get("ts"),
         )
-        return JSONResponse({"ok": True})
-
-    if not parsed["status_option_id"]:
-        parsed["status_option_id"] = get_settings()["OPT_STATUS_NOT_STARTED"]
-
-    try:
-        async with TASK_ID_LOCK:
-            next_task_id = get_next_task_id()
-            created = create_slack_list_item(
-                title=parsed["title"],
-                description=parsed["description"],
-                sender_user_id=sender_user_id,
-                assignee_user_id=assignee_user_id,
-                due_date=parsed["due_date"],
-                priority_rating=parsed["priority_rating"],
-                status_option_id=parsed["status_option_id"],
-                task_id=next_task_id,
-            )
-    except SlackApiError as e:
-        error = e.response.get("error", "unknown_error")
-        logger.exception("Slack Lists create failed")
-        post_dm(
-            dm_channel_id,
-            f"❌ I couldn't create the task. Slack returned: {error}",
-        )
-        return JSONResponse({"ok": True})
-
-    row_id = created.get("item", {}).get("id") or created.get("id") or created.get("row_id") or "unknown"
-    confirmation_text = (
-        f"✅ Task created successfully. Task ID: {next_task_id}\n\n"
-        f"Title: {parsed['title']}\n"
-        f"Assignee: <@{assignee_user_id}>\n"
-        f"Due: {parsed['due_date'] or 'No due date'}\n"
-        f"Priority: {parsed['priority_label']}\n"
-        f"Row ID: {row_id}"
-    )
-    post_dm(dm_channel_id, confirmation_text)
-
-    post_dm_to_user(
-        assignee_user_id,
-        f"📌 A new task has been assigned to you: *{parsed['title']}*\nTask ID: {next_task_id}\nDue: {parsed['due_date'] or 'No due date'}\nPriority: {PRIORITY_RATING_TO_LABEL.get(parsed['priority_rating'], 'medium')}"
-    )
 
     return JSONResponse({"ok": True})

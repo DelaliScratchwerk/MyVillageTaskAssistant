@@ -90,11 +90,34 @@ reject 2
 edit 1 assignee Delali due Friday priority high
 ```
 
+## Team channel huddle notes
+Map each Slack channel to the Slack List that should receive that channel's tasks:
+
+```bash
+CHANNEL_LIST_MAP_JSON='{"C_TEAM_CHANNEL_ID":"F_TEAM_LIST_ID"}'
+```
+
+Mention the bot in the team channel and paste the Slack AI huddle notes:
+
+```text
+@My Village Task Assistant Process huddle notes:
+[paste huddle notes here]
+```
+
+The app replies in a thread with proposed tasks. Mention the bot again in the same channel to approve:
+
+```text
+@My Village Task Assistant approve all
+```
+
 ## Slack setup
 - Event Subscriptions: ON
 - Request URL: https://your-public-url/slack/events
-- Bot events: message.im
+- Bot events:
+  - message.im
+  - app_mention
 - Scopes:
+  - app_mentions:read
   - chat:write
   - im:history
   - lists:write
