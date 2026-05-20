@@ -1551,10 +1551,11 @@ async def handle_task_assistant_message(
             return JSONResponse({"ok": True})
         # Create approved tasks
         created_count = 0
+        task_bot_user_id = get_required_env("TASK_BOT_USER_ID")
         for task in approved_tasks:
-            assignee_user_id = resolve_user_id(task["assignee_name"], sender_user_id)
+            assignee_user_id = resolve_user_id(task["assignee_name"], sender_user_id, default_to_sender=False)
             if assignee_user_id is None:
-                assignee_user_id = sender_user_id
+                assignee_user_id = task_bot_user_id
             priority_rating = parse_priority(task["priority"])
             status_option_id = get_settings()["OPT_STATUS_NOT_STARTED"]
             try:
@@ -1563,7 +1564,7 @@ async def handle_task_assistant_message(
                     create_slack_list_item(
                         title=task["title"],
                         description=task["description"],
-                        sender_user_id=sender_user_id,
+                        sender_user_id=task_bot_user_id,
                         assignee_user_id=assignee_user_id,
                         due_date=task["due_date"],
                         priority_rating=priority_rating,
@@ -1571,10 +1572,6 @@ async def handle_task_assistant_message(
                         task_id=next_task_id,
                         list_id=list_id,
                     )
-                post_dm_to_user(
-                    assignee_user_id,
-                    f"📌 A new task has been assigned to you: *{task['title']}*\nTask ID: {next_task_id}\nDue: {task['due_date'] or 'No due date'}\nPriority: {task['priority'] or 'medium'}"
-                )
                 created_count += 1
             except SlackApiError:
                 logger.exception("Failed to create task from transcript")
@@ -1643,15 +1640,10 @@ async def handle_task_assistant_message(
         )
         return JSONResponse({"ok": True})
 
-    assignee_user_id = resolve_user_id(parsed["assignee_name"], sender_user_id)
+    task_bot_user_id = get_required_env("TASK_BOT_USER_ID")
+    assignee_user_id = resolve_user_id(parsed["assignee_name"], sender_user_id, default_to_sender=False)
     if assignee_user_id is None:
-        post_message(
-            response_channel_id,
-            f'⚠️ I could not find a team member named "{parsed["assignee_name"]}". '
-            "Please try again with a valid team member name or omit the assignee to assign it to yourself.",
-            thread_ts,
-        )
-        return JSONResponse({"ok": True})
+        assignee_user_id = task_bot_user_id
 
     if not parsed["status_option_id"]:
         parsed["status_option_id"] = get_settings()["OPT_STATUS_NOT_STARTED"]
@@ -1662,7 +1654,7 @@ async def handle_task_assistant_message(
             created = create_slack_list_item(
                 title=parsed["title"],
                 description=parsed["description"],
-                sender_user_id=sender_user_id,
+                sender_user_id=task_bot_user_id,
                 assignee_user_id=assignee_user_id,
                 due_date=parsed["due_date"],
                 priority_rating=parsed["priority_rating"],
