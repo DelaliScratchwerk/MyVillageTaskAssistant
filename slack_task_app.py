@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, time
 import calendar
 from contextlib import asynccontextmanager
@@ -518,6 +519,107 @@ def add_huddle_task(
     })
 
 
+TASK_MATCH_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "by",
+    "for",
+    "from",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+    "will",
+}
+
+
+def normalize_task_match_text(value: str) -> str:
+    text = value.lower()
+    text = re.sub(r"<@[a-z0-9]+>", " ", text)
+    text = text.replace("@", " ")
+    text = re.sub(r"\[[0-9:]+\]", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    words = [
+        word
+        for word in text.split()
+        if len(word) > 2 and word not in TASK_MATCH_STOP_WORDS
+    ]
+    return " ".join(words)
+
+
+def task_match_score(proposed_task: dict, existing_task: dict) -> float:
+    proposed_text = normalize_task_match_text(str(proposed_task.get("title") or ""))
+    existing_text = normalize_task_match_text(str(existing_task.get("title") or ""))
+    if not proposed_text or not existing_text:
+        return 0.0
+
+    proposed_tokens = set(proposed_text.split())
+    existing_tokens = set(existing_text.split())
+    shared_tokens = proposed_tokens & existing_tokens
+    if len(shared_tokens) < 3:
+        return 0.0
+
+    overlap = len(proposed_tokens & existing_tokens) / max(len(proposed_tokens), 1)
+    sequence_score = SequenceMatcher(None, proposed_text, existing_text).ratio()
+    return max(overlap, sequence_score)
+
+
+def find_similar_open_task(proposed_task: dict, existing_tasks: list[dict], used_row_ids: set[str]) -> Optional[tuple[dict, float]]:
+    best_task = None
+    best_score = 0.0
+
+    for existing_task in existing_tasks:
+        row_id = str(existing_task.get("row_id") or "")
+        if row_id in used_row_ids or is_done_task(existing_task):
+            continue
+        score = task_match_score(proposed_task, existing_task)
+        if score > best_score:
+            best_task = existing_task
+            best_score = score
+
+    if best_task is not None and best_score >= 0.48:
+        used_row_ids.add(str(best_task.get("row_id") or ""))
+        return best_task, best_score
+    return None
+
+
+def classify_similar_huddle_tasks(parsed_transcript: dict, list_id: str) -> dict:
+    settings = get_settings()
+    rows = fetch_all_slack_list_rows(list_id)
+    existing_tasks = [normalize_task_row(row, settings) for row in rows]
+    for task in existing_tasks:
+        task["list_id"] = list_id
+
+    tasks_to_create = []
+    tasks_to_update = []
+    used_row_ids = set()
+
+    for proposed_task in parsed_transcript.get("tasks_to_create", []):
+        match = find_similar_open_task(proposed_task, existing_tasks, used_row_ids)
+        if match is None:
+            tasks_to_create.append(proposed_task)
+            continue
+
+        existing_task, score = match
+        tasks_to_update.append(
+            {
+                "existing_task": existing_task,
+                "task": proposed_task,
+                "similarity": score,
+            }
+        )
+
+    parsed_transcript["tasks_to_create"] = tasks_to_create
+    parsed_transcript["tasks_to_update"] = tasks_to_update
+    return parsed_transcript
+
+
 def parse_huddle_transcript(transcript: str) -> dict:
     """Parse a Slack huddle transcript into structured actions."""
     lines = transcript.split('\n')
@@ -604,22 +706,33 @@ def parse_transcript_action_indexes(raw_indexes: str, item_count: int) -> list[i
 
 
 def build_transcript_proposal_message(parsed_transcript: dict) -> str:
+    actions = get_pending_transcript_actions(parsed_transcript)
     proposal = (
         f"I found:\n"
         f"- {len(parsed_transcript['tasks_to_create'])} tasks to create\n"
+        f"- {len(parsed_transcript.get('tasks_to_update', []))} existing tasks to update\n"
         f"- {len(parsed_transcript['milestones'])} milestones\n"
         f"- {len(parsed_transcript['recurring_meetings'])} recurring meetings\n\n"
         "Proposed actions:\n"
     )
 
-    if parsed_transcript["tasks_to_create"]:
-        for idx, task in enumerate(parsed_transcript["tasks_to_create"], start=1):
+    if actions:
+        for idx, action in enumerate(actions, start=1):
+            task = action["task"]
             due_text = f", due {task['due_date']}" if task.get("due_date") else ""
             priority_text = f", priority {task.get('priority') or 'medium'}"
-            proposal += (
-                f"{idx}. Create task for {task['assignee_name'] or 'Team'}: "
-                f"{task['title']}{due_text}{priority_text}\n"
-            )
+            if action["kind"] == "update":
+                existing_task = action["existing_task"]
+                task_id = existing_task.get("task_id") or "existing task"
+                proposal += (
+                    f"{idx}. Update {task_id}: add huddle note for "
+                    f"{task['assignee_name'] or 'Team'}: {task['title']}{due_text}{priority_text}\n"
+                )
+            else:
+                proposal += (
+                    f"{idx}. Create task for {task['assignee_name'] or 'Team'}: "
+                    f"{task['title']}{due_text}{priority_text}\n"
+                )
     else:
         proposal += "No tasks are currently queued.\n"
 
@@ -631,6 +744,49 @@ def build_transcript_proposal_message(parsed_transcript: dict) -> str:
         "- edit 1 assignee Delali due Friday priority high"
     )
     return proposal
+
+
+def get_pending_transcript_actions(pending: dict) -> list[dict]:
+    actions = []
+    for task in pending.get("tasks_to_create", []):
+        actions.append({"kind": "create", "task": task})
+    for update in pending.get("tasks_to_update", []):
+        actions.append(
+            {
+                "kind": "update",
+                "task": update["task"],
+                "existing_task": update["existing_task"],
+                "similarity": update.get("similarity", 0.0),
+            }
+        )
+    return actions
+
+
+def remove_pending_transcript_actions(pending: dict, indexes: list[int]) -> list[str]:
+    rejected = []
+    rejected_index_set = set(indexes)
+
+    create_actions = []
+    for task in pending.get("tasks_to_create", []):
+        create_actions.append({"kind": "create", "task": task})
+    update_actions = []
+    for update in pending.get("tasks_to_update", []):
+        update_actions.append({"kind": "update", "update": update, "task": update["task"]})
+
+    actions = create_actions + update_actions
+    pending["tasks_to_create"] = []
+    pending["tasks_to_update"] = []
+
+    for index, action in enumerate(actions):
+        if index in rejected_index_set:
+            rejected.append(action["task"]["title"])
+            continue
+        if action["kind"] == "create":
+            pending["tasks_to_create"].append(action["task"])
+        else:
+            pending["tasks_to_update"].append(action["update"])
+
+    return rejected
 
 
 def extract_transcript_edit_field(body: str, field_name: str) -> Optional[str]:
@@ -680,29 +836,26 @@ def handle_transcript_approval(channel_id: str, text: str) -> Optional[dict]:
 
     pending = PENDING_TRANSCRIPT_ACTIONS[channel_id]
     lower_text = text.lower().strip()
-    tasks = pending["tasks_to_create"]
+    actions = get_pending_transcript_actions(pending)
 
-    if lower_text == "approve all":
-        return {"action": "approve", "tasks": list(tasks)}
+    if lower_text in {"approve", "approve all", "yes", "yes all", "yes to all"}:
+        return {"action": "approve", "actions": list(actions)}
 
     if lower_text.startswith("approve "):
         raw_indexes = text.strip()[len("approve "):]
-        indexes = parse_transcript_action_indexes(raw_indexes, len(tasks))
+        indexes = parse_transcript_action_indexes(raw_indexes, len(actions))
         if not indexes:
             return {"action": "message", "text": "I could not find any matching tasks to approve."}
-        approved_tasks = [tasks[index] for index in indexes]
-        return {"action": "approve", "tasks": approved_tasks}
+        approved_actions = [actions[index] for index in indexes]
+        return {"action": "approve", "actions": approved_actions}
 
     if lower_text.startswith("reject "):
         raw_indexes = text.strip()[len("reject "):]
-        indexes = parse_transcript_action_indexes(raw_indexes, len(tasks))
+        indexes = parse_transcript_action_indexes(raw_indexes, len(actions))
         if not indexes:
             return {"action": "message", "text": "I could not find any matching tasks to reject."}
 
-        rejected = [tasks[index]["title"] for index in indexes]
-        pending["tasks_to_create"] = [
-            task for index, task in enumerate(tasks) if index not in indexes
-        ]
+        rejected = remove_pending_transcript_actions(pending, indexes)
         return {
             "action": "message",
             "text": "Rejected:\n- " + "\n- ".join(rejected) + "\n\n" + build_transcript_proposal_message(pending),
@@ -711,10 +864,10 @@ def handle_transcript_approval(channel_id: str, text: str) -> Optional[dict]:
     edit_match = re.fullmatch(r"edit\s+(\d+)\s+(.+)", text.strip(), flags=re.I | re.S)
     if edit_match:
         index = int(edit_match.group(1)) - 1
-        if not 0 <= index < len(tasks):
+        if not 0 <= index < len(actions):
             return {"action": "message", "text": f"I could not find task {index + 1} to edit."}
 
-        changes = apply_transcript_task_edit(tasks[index], edit_match.group(2))
+        changes = apply_transcript_task_edit(actions[index]["task"], edit_match.group(2))
         if not changes:
             return {
                 "action": "message",
@@ -1180,6 +1333,55 @@ def update_task_status(
     update_slack_list_item_cells(task["row_id"], cells, list_id or task.get("list_id"))
 
 
+def build_huddle_update_description(existing_description: str, proposed_task: dict) -> str:
+    source_excerpt = str(proposed_task.get("source_excerpt") or proposed_task.get("title") or "").strip()
+    if not source_excerpt:
+        return existing_description
+    if source_excerpt in existing_description:
+        return existing_description
+
+    update_note = f"Huddle update {date.today().isoformat()}:\n{source_excerpt}"
+    if not existing_description:
+        return update_note
+    return f"{existing_description}\n\n{update_note}"
+
+
+def update_task_from_huddle_action(
+    *,
+    existing_task: dict,
+    proposed_task: dict,
+    assignee_user_id: str,
+    priority_rating: int,
+    list_id: str,
+) -> None:
+    settings = get_settings()
+    cells = [
+        rich_text_field(
+            settings["COL_DESCRIPTION"],
+            build_huddle_update_description(existing_task.get("description") or "", proposed_task),
+        ),
+        {
+            "column_id": settings["COL_ASSIGNEE"],
+            "user": [assignee_user_id],
+        },
+        {
+            "column_id": settings["COL_PRIORITY"],
+            "rating": [priority_rating],
+        },
+    ]
+
+    due_date = proposed_task.get("due_date")
+    if due_date:
+        cells.append(
+            {
+                "column_id": settings["COL_DUE_DATE"],
+                "date": [due_date],
+            }
+        )
+
+    update_slack_list_item_cells(existing_task["row_id"], cells, list_id)
+
+
 def post_message(channel_id: str, text: str, thread_ts: Optional[str] = None) -> None:
     kwargs = {"channel": channel_id, "text": text}
     if thread_ts:
@@ -1529,6 +1731,23 @@ def strip_leading_app_mention(text: str) -> str:
     return re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text, count=1).strip()
 
 
+def build_task_assistant_help_message() -> str:
+    return (
+        "Task Assistant commands:\n"
+        "- Process huddle notes: [paste notes]\n"
+        "- Create task: task title, assign to Name, due Friday, priority high\n"
+        "- done DEV-0001\n"
+        "- start DEV-0001\n"
+        "- block DEV-0001 waiting on info\n\n"
+        "For huddle proposals:\n"
+        "- yes\n"
+        "- yes to all\n"
+        "- approve 1,3\n"
+        "- reject 2\n"
+        "- edit 1 assignee Delali due Friday priority high"
+    )
+
+
 async def handle_task_assistant_message(
     *,
     sender_user_id: str,
@@ -1537,6 +1756,10 @@ async def handle_task_assistant_message(
     list_id: str,
     thread_ts: Optional[str] = None,
 ) -> JSONResponse:
+    if text.strip().lower() in {"", "help", "commands"}:
+        post_message(response_channel_id, build_task_assistant_help_message(), thread_ts)
+        return JSONResponse({"ok": True})
+
     # Check for transcript approval commands
     transcript_action = handle_transcript_approval(response_channel_id, text)
     if transcript_action is not None:
@@ -1544,38 +1767,54 @@ async def handle_task_assistant_message(
             post_message(response_channel_id, transcript_action["text"], thread_ts)
             return JSONResponse({"ok": True})
 
-        approved_tasks = transcript_action["tasks"]
-        if not approved_tasks:
+        approved_actions = transcript_action["actions"]
+        if not approved_actions:
             post_message(response_channel_id, "No tasks approved.", thread_ts)
             del PENDING_TRANSCRIPT_ACTIONS[response_channel_id]
             return JSONResponse({"ok": True})
-        # Create approved tasks
+        # Create or update approved tasks.
         created_count = 0
+        updated_count = 0
         task_bot_user_id = get_required_env("TASK_BOT_USER_ID")
-        for task in approved_tasks:
+        for approved_action in approved_actions:
+            task = approved_action["task"]
             assignee_user_id = resolve_user_id(task["assignee_name"], sender_user_id, default_to_sender=False)
             if assignee_user_id is None:
                 assignee_user_id = task_bot_user_id
             priority_rating = parse_priority(task["priority"])
             status_option_id = get_settings()["OPT_STATUS_NOT_STARTED"]
             try:
-                async with TASK_ID_LOCK:
-                    next_task_id = get_next_task_id(list_id)
-                    create_slack_list_item(
-                        title=task["title"],
-                        description=task["description"],
-                        sender_user_id=task_bot_user_id,
+                if approved_action["kind"] == "update":
+                    update_task_from_huddle_action(
+                        existing_task=approved_action["existing_task"],
+                        proposed_task=task,
                         assignee_user_id=assignee_user_id,
-                        due_date=task["due_date"],
                         priority_rating=priority_rating,
-                        status_option_id=status_option_id,
-                        task_id=next_task_id,
                         list_id=list_id,
                     )
-                created_count += 1
+                    updated_count += 1
+                else:
+                    async with TASK_ID_LOCK:
+                        next_task_id = get_next_task_id(list_id)
+                        create_slack_list_item(
+                            title=task["title"],
+                            description=task["description"],
+                            sender_user_id=task_bot_user_id,
+                            assignee_user_id=assignee_user_id,
+                            due_date=task["due_date"],
+                            priority_rating=priority_rating,
+                            status_option_id=status_option_id,
+                            task_id=next_task_id,
+                            list_id=list_id,
+                        )
+                    created_count += 1
             except SlackApiError:
-                logger.exception("Failed to create task from transcript")
-        post_message(response_channel_id, f"✅ Created {created_count} tasks from transcript.", thread_ts)
+                logger.exception("Failed to apply task action from transcript")
+        post_message(
+            response_channel_id,
+            f"✅ Created {created_count} tasks and updated {updated_count} tasks from transcript.",
+            thread_ts,
+        )
         del PENDING_TRANSCRIPT_ACTIONS[response_channel_id]
         return JSONResponse({"ok": True})
 
@@ -1591,6 +1830,10 @@ async def handle_task_assistant_message(
                 transcript_body = re.sub(re.escape(trigger), "", transcript_body, count=1, flags=re.I).strip()
                 break
         parsed_transcript = parse_huddle_transcript(transcript_body)
+        try:
+            parsed_transcript = classify_similar_huddle_tasks(parsed_transcript, list_id)
+        except Exception:
+            logger.exception("Failed to classify similar huddle tasks")
         PENDING_TRANSCRIPT_ACTIONS[response_channel_id] = parsed_transcript
         post_message(response_channel_id, build_transcript_proposal_message(parsed_transcript), thread_ts)
         return JSONResponse({"ok": True})
