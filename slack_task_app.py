@@ -429,6 +429,10 @@ def clean_huddle_action_item_line(line: str) -> Optional[str]:
 
 
 def extract_assignee_name_from_action_item(item_text: str) -> str:
+    slack_mention_match = re.search(r"<@(U[A-Z0-9]+)>", item_text)
+    if slack_mention_match:
+        return f"<@{slack_mention_match.group(1)}>"
+
     mention_match = re.search(r"@([^,\[]+?)(?:\s+to\s+|\s+will\s+|$)", item_text)
     if mention_match:
         return mention_match.group(1).strip()
@@ -451,6 +455,11 @@ def is_likely_huddle_text(text: str) -> bool:
     if "action items" in lower_text and "attendees" in lower_text:
         return True
     return False
+
+
+def is_raw_huddle_transcript(text: str) -> bool:
+    lower_text = text.lower()
+    return "transcript of huddle" in lower_text or "transcript file:" in lower_text
 
 
 TEXT_TRANSCRIPT_EXTENSIONS = (".txt", ".md", ".vtt", ".srt")
@@ -684,7 +693,7 @@ def classify_similar_huddle_tasks(parsed_transcript: dict, list_id: str) -> dict
     return parsed_transcript
 
 
-def parse_huddle_transcript(transcript: str) -> dict:
+def parse_huddle_transcript(transcript: str, allow_transcript_fallback: bool = True) -> dict:
     """Parse a Slack huddle transcript into structured actions."""
     lines = transcript.split('\n')
     project_name = ""
@@ -740,7 +749,7 @@ def parse_huddle_transcript(transcript: str) -> dict:
                 continue
             add_huddle_task(tasks_to_create, item_text, project_name, "huddle_notes")
 
-    if not tasks_to_create:
+    if allow_transcript_fallback and not tasks_to_create:
         for line in lines:
             item_text = clean_huddle_transcript_line(line)
             if item_text is not None:
@@ -958,6 +967,13 @@ def resolve_user_id(name: str, sender_user_id: str, default_to_sender: bool = Tr
         return sender_user_id if default_to_sender else None
 
     normalized = normalize_name(name)
+    raw_name = name.strip()
+
+    mention_match = re.fullmatch(r"<@(U[A-Z0-9]+)>", raw_name)
+    if mention_match:
+        return mention_match.group(1)
+    if is_slack_user_id(raw_name):
+        return raw_name
 
     # 1) Static map exact match wins
     if normalized in TEAM_USER_MAP:
@@ -1804,7 +1820,7 @@ def build_task_assistant_help_message() -> str:
     return (
         "Task Assistant commands:\n"
         "- Process huddle notes: [paste notes]\n"
-        "- Process transcript: upload a .txt transcript file with this mention\n"
+        "- Process huddle notes: upload a .txt file containing Slack AI huddle notes\n"
         "- Create task: task title, assign to Name, due Friday, priority high\n"
         "- done DEV-0001\n"
         "- start DEV-0001\n"
@@ -1904,11 +1920,22 @@ async def handle_task_assistant_message(
             if trigger.lower() in transcript_body.lower():
                 transcript_body = re.sub(re.escape(trigger), "", transcript_body, count=1, flags=re.I).strip()
                 break
-        parsed_transcript = parse_huddle_transcript(transcript_body)
+        parsed_transcript = parse_huddle_transcript(
+            transcript_body,
+            allow_transcript_fallback=not file_transcript_text and not is_raw_huddle_transcript(transcript_body),
+        )
         try:
             parsed_transcript = classify_similar_huddle_tasks(parsed_transcript, list_id)
         except Exception:
             logger.exception("Failed to classify similar huddle tasks")
+        if not get_pending_transcript_actions(parsed_transcript):
+            post_message(
+                response_channel_id,
+                "I could not find a clear Action items section to turn into tasks. "
+                "Please attach or paste the Slack AI huddle notes/canvas text instead of the raw transcript.",
+                thread_ts,
+            )
+            return JSONResponse({"ok": True})
         PENDING_TRANSCRIPT_ACTIONS[response_channel_id] = parsed_transcript
         post_message(response_channel_id, build_transcript_proposal_message(parsed_transcript), thread_ts)
         return JSONResponse({"ok": True})

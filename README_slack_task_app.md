@@ -104,11 +104,13 @@ Mention the bot in the team channel and paste the Slack AI huddle notes:
 [paste huddle notes here]
 ```
 
-Or mention the bot and attach a `.txt`, `.md`, `.vtt`, or `.srt` transcript file:
+Or mention the bot and attach a `.txt`, `.md`, `.vtt`, or `.srt` file that contains the Slack AI huddle notes/canvas text:
 
 ```text
-@My Village Task Assistant Process transcript:
+@My Village Task Assistant Process huddle notes:
 ```
+
+Raw huddle transcripts are too noisy for the rule-based parser; use the Slack AI huddle notes with the Action items section.
 
 The app replies in a thread with proposed tasks. Mention the bot again in the same channel to approve:
 
