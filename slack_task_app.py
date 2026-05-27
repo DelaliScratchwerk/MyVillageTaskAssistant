@@ -11,6 +11,8 @@ from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 from functools import lru_cache
 from typing import Any, Dict, Optional
+from urllib.error import URLError
+from urllib.request import Request as UrlRequest, urlopen
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -449,6 +451,68 @@ def is_likely_huddle_text(text: str) -> bool:
     if "action items" in lower_text and "attendees" in lower_text:
         return True
     return False
+
+
+TEXT_TRANSCRIPT_EXTENSIONS = (".txt", ".md", ".vtt", ".srt")
+MAX_TRANSCRIPT_FILE_BYTES = 2 * 1024 * 1024
+
+
+def is_supported_transcript_file(file_info: dict) -> bool:
+    name = str(file_info.get("name") or file_info.get("title") or "").lower()
+    mimetype = str(file_info.get("mimetype") or "").lower()
+    filetype = str(file_info.get("filetype") or "").lower()
+
+    if mimetype.startswith("text/"):
+        return True
+    if name.endswith(TEXT_TRANSCRIPT_EXTENSIONS):
+        return True
+    if filetype in {"text", "plain_text", "markdown", "vtt", "srt"}:
+        return True
+    return False
+
+
+def download_slack_text_file(file_info: dict) -> Optional[str]:
+    if not is_supported_transcript_file(file_info):
+        return None
+
+    url = file_info.get("url_private_download") or file_info.get("url_private")
+    if not url:
+        file_id = file_info.get("id") or "unknown"
+        logger.warning("Slack file %s did not include a private download URL", file_id)
+        return None
+
+    request = UrlRequest(
+        str(url),
+        headers={"Authorization": f"Bearer {get_settings()['SLACK_BOT_TOKEN']}"},
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            data = response.read(MAX_TRANSCRIPT_FILE_BYTES + 1)
+    except URLError:
+        logger.exception("Failed to download Slack transcript file")
+        return None
+
+    if len(data) > MAX_TRANSCRIPT_FILE_BYTES:
+        logger.warning("Skipping Slack transcript file larger than %s bytes", MAX_TRANSCRIPT_FILE_BYTES)
+        return None
+
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return data.decode(encoding).strip()
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def extract_transcript_text_from_files(files: Optional[list[dict]]) -> str:
+    transcript_parts = []
+    for file_info in files or []:
+        text = download_slack_text_file(file_info)
+        if not text:
+            continue
+        name = file_info.get("name") or file_info.get("title") or "transcript"
+        transcript_parts.append(f"Transcript file: {name}\n\n{text}")
+    return "\n\n".join(transcript_parts).strip()
 
 
 def clean_huddle_transcript_line(line: str) -> Optional[str]:
@@ -1731,10 +1795,16 @@ def strip_leading_app_mention(text: str) -> str:
     return re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text, count=1).strip()
 
 
+def text_mentions_task_bot(text: str) -> bool:
+    bot_user_id = os.getenv("TASK_BOT_USER_ID", "").strip()
+    return bool(bot_user_id and f"<@{bot_user_id}>" in text)
+
+
 def build_task_assistant_help_message() -> str:
     return (
         "Task Assistant commands:\n"
         "- Process huddle notes: [paste notes]\n"
+        "- Process transcript: upload a .txt transcript file with this mention\n"
         "- Create task: task title, assign to Name, due Friday, priority high\n"
         "- done DEV-0001\n"
         "- start DEV-0001\n"
@@ -1755,7 +1825,12 @@ async def handle_task_assistant_message(
     text: str,
     list_id: str,
     thread_ts: Optional[str] = None,
+    files: Optional[list[dict]] = None,
 ) -> JSONResponse:
+    file_transcript_text = extract_transcript_text_from_files(files)
+    if file_transcript_text:
+        text = f"{text}\n\n{file_transcript_text}".strip()
+
     if text.strip().lower() in {"", "help", "commands"}:
         post_message(response_channel_id, build_task_assistant_help_message(), thread_ts)
         return JSONResponse({"ok": True})
@@ -1822,7 +1897,7 @@ async def handle_task_assistant_message(
     transcript_triggers = ["Process huddle notes:", "Process transcript:", "Read these notes and make tasks:"]
     lower_text = text.lower()
     is_explicit_transcript_request = any(trigger.lower() in lower_text for trigger in transcript_triggers)
-    is_transcript_request = is_explicit_transcript_request or is_likely_huddle_text(text)
+    is_transcript_request = bool(file_transcript_text) or is_explicit_transcript_request or is_likely_huddle_text(text)
     if is_transcript_request:
         transcript_body = text
         for trigger in transcript_triggers:
@@ -1963,14 +2038,17 @@ async def slack_events(request: Request):
     if not event:
         return JSONResponse({"ok": True})
 
-    # Ignore bot messages, edits, and messages without a user.
-    if event.get("bot_id") or event.get("subtype") or not event.get("user"):
+    subtype = event.get("subtype")
+    if event.get("bot_id") or not event.get("user"):
+        return JSONResponse({"ok": True})
+    if subtype and subtype != "file_share":
         return JSONResponse({"ok": True})
 
     sender_user_id = event["user"]
     event_type = event.get("type")
     channel_id = event.get("channel")
     text = (event.get("text") or "").strip()
+    files = event.get("files") or []
 
     if event_type == "message" and event.get("channel_type") == "im":
         return await handle_task_assistant_message(
@@ -1978,6 +2056,17 @@ async def slack_events(request: Request):
             response_channel_id=channel_id,
             text=text,
             list_id=get_list_id_for_channel(),
+            files=files,
+        )
+
+    if event_type == "message" and subtype == "file_share" and channel_id and text_mentions_task_bot(text):
+        return await handle_task_assistant_message(
+            sender_user_id=sender_user_id,
+            response_channel_id=channel_id,
+            text=strip_leading_app_mention(text),
+            list_id=get_list_id_for_channel(channel_id),
+            thread_ts=event.get("thread_ts") or event.get("ts"),
+            files=files,
         )
 
     if event_type == "app_mention" and channel_id:
@@ -1987,6 +2076,7 @@ async def slack_events(request: Request):
             text=strip_leading_app_mention(text),
             list_id=get_list_id_for_channel(channel_id),
             thread_ts=event.get("thread_ts") or event.get("ts"),
+            files=files,
         )
 
     return JSONResponse({"ok": True})

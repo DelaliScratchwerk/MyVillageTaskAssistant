@@ -104,6 +104,12 @@ Mention the bot in the team channel and paste the Slack AI huddle notes:
 [paste huddle notes here]
 ```
 
+Or mention the bot and attach a `.txt`, `.md`, `.vtt`, or `.srt` transcript file:
+
+```text
+@My Village Task Assistant Process transcript:
+```
+
 The app replies in a thread with proposed tasks. Mention the bot again in the same channel to approve:
 
 ```text
@@ -116,9 +122,11 @@ The app replies in a thread with proposed tasks. Mention the bot again in the sa
 - Bot events:
   - message.im
   - app_mention
+  - message.channels (optional, only needed for transcript file shares that do not emit app_mention)
 - Scopes:
   - app_mentions:read
   - chat:write
+  - files:read
   - im:history
   - lists:write
   - users:read (optional, only if using dynamic user lookup)
