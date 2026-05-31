@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 *.sqlite3
 *.log
+.invoice_reminder_state.json
 .idea/
 *.iml
 .DS_Store

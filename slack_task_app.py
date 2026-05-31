@@ -1462,20 +1462,23 @@ def update_task_from_huddle_action(
     update_slack_list_item_cells(existing_task["row_id"], cells, list_id)
 
 
-def post_message(channel_id: str, text: str, thread_ts: Optional[str] = None) -> None:
+def post_message(channel_id: str, text: str, thread_ts: Optional[str] = None) -> bool:
     kwargs = {"channel": channel_id, "text": text}
     if thread_ts:
         kwargs["thread_ts"] = thread_ts
     try:
         get_bot_client().chat_postMessage(**kwargs)
+        return True
     except SlackApiError as e:
         logger.error("Unable to send message to Slack: %s", e.response.get('error'))
+        return False
     except Exception as e:
         logger.error("Unexpected error sending message to Slack: %s", e)
+        return False
 
 
-def post_dm(channel_id: str, text: str) -> None:
-    post_message(channel_id, text)
+def post_dm(channel_id: str, text: str) -> bool:
+    return post_message(channel_id, text)
 
 
 def post_dm_to_user(user_id: str, text: str) -> None:
@@ -1487,6 +1490,8 @@ def post_dm_to_user(user_id: str, text: str) -> None:
         logger.error("Unexpected error sending DM to user %s: %s", user_id, e)
 
 INVOICE_REMINDER_TEXT = "Reminder, please get your invoices submitted to Ms. Perez by tomorrow"
+INVOICE_REMINDER_HOUR = 8
+INVOICE_REMINDER_MINUTE = 0
 
 
 def get_invoice_reminder_channel_id() -> str:
@@ -1494,6 +1499,43 @@ def get_invoice_reminder_channel_id() -> str:
     if not channel_id:
         raise RuntimeError("Missing required environment variable: INVOICE_REMINDER_CHANNEL_ID")
     return channel_id
+
+
+def get_invoice_reminder_state_file() -> str:
+    return os.getenv("INVOICE_REMINDER_STATE_FILE", ".invoice_reminder_state.json").strip()
+
+
+def get_last_invoice_reminder_sent_date() -> Optional[date]:
+    state_file = get_invoice_reminder_state_file()
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.exception("Unable to read invoice reminder state file")
+        return None
+
+    raw_date = state.get("last_sent_date") if isinstance(state, dict) else None
+    if not raw_date:
+        return None
+    try:
+        return date.fromisoformat(str(raw_date))
+    except ValueError:
+        logger.warning("Ignoring invalid invoice reminder last_sent_date=%s", raw_date)
+        return None
+
+
+def mark_invoice_reminder_sent(day: date) -> None:
+    state_file = get_invoice_reminder_state_file()
+    state = {"last_sent_date": day.isoformat()}
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+        f.write("\n")
+
+
+def has_invoice_reminder_sent(day: date) -> bool:
+    return get_last_invoice_reminder_sent_date() == day
 
 
 def get_app_timezone() -> ZoneInfo:
@@ -1507,7 +1549,23 @@ def is_last_day_of_month(day: date) -> bool:
 
 
 def should_send_invoice_reminder(day: date) -> bool:
-    return day.day == 14 or is_last_day_of_month(day)
+    return day.day in {1, 14, 15} or is_last_day_of_month(day)
+
+
+def invoice_reminder_send_time(day: date, tz: ZoneInfo) -> datetime:
+    return datetime.combine(
+        day,
+        time(hour=INVOICE_REMINDER_HOUR, minute=INVOICE_REMINDER_MINUTE),
+        tzinfo=tz,
+    )
+
+
+def should_send_invoice_reminder_now(now: datetime) -> bool:
+    return (
+        should_send_invoice_reminder(now.date())
+        and now >= invoice_reminder_send_time(now.date(), get_app_timezone())
+        and not has_invoice_reminder_sent(now.date())
+    )
 
 
 def next_invoice_reminder_time(now: datetime) -> datetime:
@@ -1516,9 +1574,9 @@ def next_invoice_reminder_time(now: datetime) -> datetime:
     # Start checking from today's 8 AM
     candidate_day = now.date()
     while True:
-        candidate = datetime.combine(candidate_day, time(hour=8, minute=0), tzinfo=tz)
+        candidate = invoice_reminder_send_time(candidate_day, tz)
 
-        if candidate > now and should_send_invoice_reminder(candidate_day):
+        if candidate > now and should_send_invoice_reminder(candidate_day) and not has_invoice_reminder_sent(candidate_day):
             return candidate
 
         candidate_day = candidate_day + timedelta(days=1)
@@ -1661,6 +1719,17 @@ async def invoice_reminder_loop() -> None:
         try:
             tz = get_app_timezone()
             now = datetime.now(tz)
+
+            if should_send_invoice_reminder_now(now):
+                reminder_day = now.date()
+                channel_id = get_invoice_reminder_channel_id()
+                sent = post_dm(channel_id, INVOICE_REMINDER_TEXT)
+                if sent:
+                    mark_invoice_reminder_sent(reminder_day)
+                    logger.info("Invoice reminder sent to channel %s", channel_id)
+                await asyncio.sleep(60)
+                continue
+
             next_run = next_invoice_reminder_time(now)
 
             sleep_seconds = (next_run - now).total_seconds()
@@ -1668,10 +1737,12 @@ async def invoice_reminder_loop() -> None:
 
             await asyncio.sleep(sleep_seconds)
 
+            reminder_day = datetime.now(tz).date()
             channel_id = get_invoice_reminder_channel_id()
-            post_dm(channel_id, INVOICE_REMINDER_TEXT)
-
-            logger.info("Invoice reminder sent to channel %s", channel_id)
+            sent = post_dm(channel_id, INVOICE_REMINDER_TEXT)
+            if sent:
+                mark_invoice_reminder_sent(reminder_day)
+                logger.info("Invoice reminder sent to channel %s", channel_id)
 
             # Prevent accidental double-send if the loop wakes up again within the same minute
             await asyncio.sleep(60)
