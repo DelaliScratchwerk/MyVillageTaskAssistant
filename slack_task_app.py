@@ -1501,6 +1501,46 @@ def get_invoice_reminder_channel_id() -> str:
     return channel_id
 
 
+def get_invoice_reminder_channel_ids() -> list[str]:
+    channel_ids = []
+
+    for channel_type in ("public_channel", "private_channel"):
+        cursor = None
+        while True:
+            kwargs = {
+                "types": channel_type,
+                "exclude_archived": True,
+                "limit": 200,
+            }
+            if cursor:
+                kwargs["cursor"] = cursor
+
+            try:
+                response = get_bot_client().conversations_list(**kwargs)
+            except SlackApiError as e:
+                logger.error("Unable to list Slack %s reminders channels: %s", channel_type, e.response.get("error"))
+                break
+            except Exception as e:
+                logger.error("Unexpected error listing Slack %s reminder channels: %s", channel_type, e)
+                break
+
+            for channel in response.get("channels", []):
+                channel_id = str(channel.get("id") or "").strip()
+                if channel_id and channel.get("is_member") and not channel.get("is_archived"):
+                    channel_ids.append(channel_id)
+
+            cursor = response.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+    unique_channel_ids = list(dict.fromkeys(channel_ids))
+    if unique_channel_ids:
+        return unique_channel_ids
+
+    logger.warning("No Slack channels discovered for invoice reminders; falling back to INVOICE_REMINDER_CHANNEL_ID")
+    return [get_invoice_reminder_channel_id()]
+
+
 def get_invoice_reminder_state_file() -> str:
     return os.getenv("INVOICE_REMINDER_STATE_FILE", ".invoice_reminder_state.json").strip()
 
@@ -1686,6 +1726,17 @@ def send_task_due_reminders(today: date) -> int:
     return sent_count
 
 
+def send_invoice_reminders() -> int:
+    sent_count = 0
+    channel_ids = get_invoice_reminder_channel_ids()
+    for channel_id in channel_ids:
+        if post_dm(channel_id, INVOICE_REMINDER_TEXT):
+            sent_count += 1
+
+    logger.info("Invoice reminder sent to %s of %s channels", sent_count, len(channel_ids))
+    return sent_count
+
+
 async def task_due_reminder_loop() -> None:
     while True:
         try:
@@ -1722,11 +1773,9 @@ async def invoice_reminder_loop() -> None:
 
             if should_send_invoice_reminder_now(now):
                 reminder_day = now.date()
-                channel_id = get_invoice_reminder_channel_id()
-                sent = post_dm(channel_id, INVOICE_REMINDER_TEXT)
-                if sent:
+                sent_count = send_invoice_reminders()
+                if sent_count > 0:
                     mark_invoice_reminder_sent(reminder_day)
-                    logger.info("Invoice reminder sent to channel %s", channel_id)
                 await asyncio.sleep(60)
                 continue
 
@@ -1738,11 +1787,9 @@ async def invoice_reminder_loop() -> None:
             await asyncio.sleep(sleep_seconds)
 
             reminder_day = datetime.now(tz).date()
-            channel_id = get_invoice_reminder_channel_id()
-            sent = post_dm(channel_id, INVOICE_REMINDER_TEXT)
-            if sent:
+            sent_count = send_invoice_reminders()
+            if sent_count > 0:
                 mark_invoice_reminder_sent(reminder_day)
-                logger.info("Invoice reminder sent to channel %s", channel_id)
 
             # Prevent accidental double-send if the loop wakes up again within the same minute
             await asyncio.sleep(60)
