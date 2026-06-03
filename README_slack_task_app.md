@@ -61,7 +61,7 @@ TASK_REMINDER_MINUTE=0
 ```
 
 ## Invoice reminders
-The app sends invoice reminders at 8:00 AM Eastern on the 1st and 15th of each month. It sends to every public or private channel the bot is a member of. If the app was down at the scheduled time, it catches up for the most recent missed invoice reminder within 48 hours. Missed reminders use a follow-up message asking people to send invoices if they have not already.
+The app sends invoice reminders at 8:00 AM Eastern on the 1st and 15th of each month. A temporary test reminder is scheduled for June 3, 2026 and should be removed after confirming the reminder works. It sends to every public or private channel the bot is a member of. If the app was down at the scheduled time, it catches up for the most recent missed invoice reminder within 48 hours. Missed reminders use a follow-up message asking people to send invoices if they have not already.
 
 Optional `.env` values:
 
