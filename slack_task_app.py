@@ -1490,6 +1490,7 @@ def post_dm_to_user(user_id: str, text: str) -> None:
         logger.error("Unexpected error sending DM to user %s: %s", user_id, e)
 
 INVOICE_REMINDER_TEXT = "Reminder, please get your invoices submitted to Ms. Perez by tomorrow"
+MISSED_INVOICE_DUE_DAY_REMINDER_TEXT = "If you haven't already, don't forget to send your invoice to Ms. Sophia."
 INVOICE_REMINDER_HOUR = 8
 INVOICE_REMINDER_MINUTE = 0
 INVOICE_REMINDER_CATCH_UP_HOURS = 48
@@ -1592,6 +1593,16 @@ def is_last_day_of_month(day: date) -> bool:
 
 def should_send_invoice_reminder(day: date) -> bool:
     return day in ONE_OFF_INVOICE_REMINDER_DATES or day.day in {1, 14, 15} or is_last_day_of_month(day)
+
+
+def is_invoice_due_day_reminder(day: date) -> bool:
+    return day.day in {1, 15}
+
+
+def get_invoice_reminder_text(reminder_day: date, missed: bool = False) -> str:
+    if missed and is_invoice_due_day_reminder(reminder_day):
+        return MISSED_INVOICE_DUE_DAY_REMINDER_TEXT
+    return INVOICE_REMINDER_TEXT
 
 
 def get_invoice_reminder_catch_up_hours() -> int:
@@ -1752,11 +1763,12 @@ def send_task_due_reminders(today: date) -> int:
     return sent_count
 
 
-def send_invoice_reminders() -> int:
+def send_invoice_reminders(reminder_day: date, missed: bool = False) -> int:
     sent_count = 0
     channel_ids = get_invoice_reminder_channel_ids()
+    message = get_invoice_reminder_text(reminder_day, missed=missed)
     for channel_id in channel_ids:
-        if post_dm(channel_id, INVOICE_REMINDER_TEXT):
+        if post_dm(channel_id, message):
             sent_count += 1
 
     logger.info("Invoice reminder sent to %s of %s channels", sent_count, len(channel_ids))
@@ -1799,7 +1811,7 @@ async def invoice_reminder_loop() -> None:
             due_invoice_reminder_day = get_due_invoice_reminder_day(now)
 
             if due_invoice_reminder_day is not None:
-                sent_count = send_invoice_reminders()
+                sent_count = send_invoice_reminders(due_invoice_reminder_day, missed=True)
                 if sent_count > 0:
                     mark_invoice_reminder_sent(due_invoice_reminder_day)
                 await asyncio.sleep(60)
@@ -1814,7 +1826,7 @@ async def invoice_reminder_loop() -> None:
 
             due_invoice_reminder_day = get_due_invoice_reminder_day(datetime.now(tz))
             if due_invoice_reminder_day is not None:
-                sent_count = send_invoice_reminders()
+                sent_count = send_invoice_reminders(due_invoice_reminder_day)
                 if sent_count > 0:
                     mark_invoice_reminder_sent(due_invoice_reminder_day)
 
