@@ -1492,6 +1492,8 @@ def post_dm_to_user(user_id: str, text: str) -> None:
 INVOICE_REMINDER_TEXT = "Reminder, please get your invoices submitted to Ms. Perez by tomorrow"
 INVOICE_REMINDER_HOUR = 8
 INVOICE_REMINDER_MINUTE = 0
+INVOICE_REMINDER_CATCH_UP_HOURS = 48
+ONE_OFF_INVOICE_REMINDER_DATES = {date(2026, 6, 3)}
 
 
 def get_invoice_reminder_channel_id() -> str:
@@ -1589,7 +1591,20 @@ def is_last_day_of_month(day: date) -> bool:
 
 
 def should_send_invoice_reminder(day: date) -> bool:
-    return day.day in {1, 14, 15} or is_last_day_of_month(day)
+    return day in ONE_OFF_INVOICE_REMINDER_DATES or day.day in {1, 14, 15} or is_last_day_of_month(day)
+
+
+def get_invoice_reminder_catch_up_hours() -> int:
+    raw_hours = os.getenv("INVOICE_REMINDER_CATCH_UP_HOURS", str(INVOICE_REMINDER_CATCH_UP_HOURS)).strip()
+    try:
+        hours = int(raw_hours)
+    except ValueError:
+        logger.warning("Invalid INVOICE_REMINDER_CATCH_UP_HOURS=%s, falling back to %s", raw_hours, INVOICE_REMINDER_CATCH_UP_HOURS)
+        return INVOICE_REMINDER_CATCH_UP_HOURS
+    if hours >= 0:
+        return hours
+    logger.warning("Invalid INVOICE_REMINDER_CATCH_UP_HOURS=%s, falling back to %s", raw_hours, INVOICE_REMINDER_CATCH_UP_HOURS)
+    return INVOICE_REMINDER_CATCH_UP_HOURS
 
 
 def invoice_reminder_send_time(day: date, tz: ZoneInfo) -> datetime:
@@ -1600,12 +1615,23 @@ def invoice_reminder_send_time(day: date, tz: ZoneInfo) -> datetime:
     )
 
 
-def should_send_invoice_reminder_now(now: datetime) -> bool:
-    return (
-        should_send_invoice_reminder(now.date())
-        and now >= invoice_reminder_send_time(now.date(), get_app_timezone())
-        and not has_invoice_reminder_sent(now.date())
-    )
+def most_recent_invoice_reminder_time(now: datetime) -> datetime:
+    tz = get_app_timezone()
+    candidate_day = now.date()
+    while True:
+        candidate = invoice_reminder_send_time(candidate_day, tz)
+        if candidate <= now and should_send_invoice_reminder(candidate_day):
+            return candidate
+        candidate_day = candidate_day - timedelta(days=1)
+
+
+def get_due_invoice_reminder_day(now: datetime) -> Optional[date]:
+    most_recent_run = most_recent_invoice_reminder_time(now)
+    catch_up_window = timedelta(hours=get_invoice_reminder_catch_up_hours())
+    reminder_day = most_recent_run.date()
+    if now - most_recent_run <= catch_up_window and not has_invoice_reminder_sent(reminder_day):
+        return reminder_day
+    return None
 
 
 def next_invoice_reminder_time(now: datetime) -> datetime:
@@ -1770,12 +1796,12 @@ async def invoice_reminder_loop() -> None:
         try:
             tz = get_app_timezone()
             now = datetime.now(tz)
+            due_invoice_reminder_day = get_due_invoice_reminder_day(now)
 
-            if should_send_invoice_reminder_now(now):
-                reminder_day = now.date()
+            if due_invoice_reminder_day is not None:
                 sent_count = send_invoice_reminders()
                 if sent_count > 0:
-                    mark_invoice_reminder_sent(reminder_day)
+                    mark_invoice_reminder_sent(due_invoice_reminder_day)
                 await asyncio.sleep(60)
                 continue
 
@@ -1786,10 +1812,11 @@ async def invoice_reminder_loop() -> None:
 
             await asyncio.sleep(sleep_seconds)
 
-            reminder_day = datetime.now(tz).date()
-            sent_count = send_invoice_reminders()
-            if sent_count > 0:
-                mark_invoice_reminder_sent(reminder_day)
+            due_invoice_reminder_day = get_due_invoice_reminder_day(datetime.now(tz))
+            if due_invoice_reminder_day is not None:
+                sent_count = send_invoice_reminders()
+                if sent_count > 0:
+                    mark_invoice_reminder_sent(due_invoice_reminder_day)
 
             # Prevent accidental double-send if the loop wakes up again within the same minute
             await asyncio.sleep(60)
