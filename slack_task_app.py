@@ -6,7 +6,6 @@ import os
 import re
 from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, time
-import calendar
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 from functools import lru_cache
@@ -1494,7 +1493,6 @@ MISSED_INVOICE_DUE_DAY_REMINDER_TEXT = "If you haven't already, don't forget to 
 INVOICE_REMINDER_HOUR = 8
 INVOICE_REMINDER_MINUTE = 0
 INVOICE_REMINDER_CATCH_UP_HOURS = 48
-ONE_OFF_INVOICE_REMINDER_DATES = {date(2026, 6, 3)}
 
 
 def get_invoice_reminder_channel_id() -> str:
@@ -1586,13 +1584,8 @@ def get_app_timezone() -> ZoneInfo:
     return ZoneInfo(tz_name)
 
 
-def is_last_day_of_month(day: date) -> bool:
-    last_day = calendar.monthrange(day.year, day.month)[1]
-    return day.day == last_day
-
-
 def should_send_invoice_reminder(day: date) -> bool:
-    return day in ONE_OFF_INVOICE_REMINDER_DATES or day.day in {1, 14, 15} or is_last_day_of_month(day)
+    return day.day in {1, 15}
 
 
 def is_invoice_due_day_reminder(day: date) -> bool:
