@@ -1908,7 +1908,6 @@ async def create_task(task: TaskCreateRequest, _api_key: None = Depends(require_
             detail="Assignee is required and must be a valid Slack user ID, mention, or team member name.",
         )
 
-    # Swap: created_by is the assignee, assignee is the Task Assistant bot
     created_by_user_id = get_required_env("TASK_BOT_USER_ID")
     assignee_user_id = resolve_slack_user(task.assignee)
     due_date = parse_due_date(task.due_date) if task.due_date else None
@@ -2010,6 +2009,7 @@ async def handle_task_assistant_message(
             return JSONResponse({"ok": True})
 
         approved_actions = transcript_action["actions"]
+        target_list_id = PENDING_TRANSCRIPT_ACTIONS.get(response_channel_id, {}).get("list_id") or list_id
         if not approved_actions:
             post_message(response_channel_id, "No tasks approved.", thread_ts)
             del PENDING_TRANSCRIPT_ACTIONS[response_channel_id]
@@ -2032,12 +2032,12 @@ async def handle_task_assistant_message(
                         proposed_task=task,
                         assignee_user_id=assignee_user_id,
                         priority_rating=priority_rating,
-                        list_id=list_id,
+                        list_id=target_list_id,
                     )
                     updated_count += 1
                 else:
                     async with TASK_ID_LOCK:
-                        next_task_id = get_next_task_id(list_id)
+                        next_task_id = get_next_task_id(target_list_id)
                         create_slack_list_item(
                             title=task["title"],
                             description=task["description"],
@@ -2047,7 +2047,7 @@ async def handle_task_assistant_message(
                             priority_rating=priority_rating,
                             status_option_id=status_option_id,
                             task_id=next_task_id,
-                            list_id=list_id,
+                            list_id=target_list_id,
                         )
                     created_count += 1
             except SlackApiError:
@@ -2087,6 +2087,7 @@ async def handle_task_assistant_message(
                 thread_ts,
             )
             return JSONResponse({"ok": True})
+        parsed_transcript["list_id"] = list_id
         PENDING_TRANSCRIPT_ACTIONS[response_channel_id] = parsed_transcript
         post_message(response_channel_id, build_transcript_proposal_message(parsed_transcript), thread_ts)
         return JSONResponse({"ok": True})
